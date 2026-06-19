@@ -14,7 +14,7 @@ use geodesy::{LatLon, Tile, MERCATOR_MAX};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -345,6 +345,11 @@ struct AppState {
     cursor: Option<(f64, f64)>,
     dragging: bool,
     last_cursor: Option<(f64, f64)>,
+    /// Active touch fingers: id -> last position. While non-empty, mouse drag
+    /// is ignored (Windows synthesises mouse events from touch).
+    touches: HashMap<u64, (f64, f64)>,
+    /// Two-finger reference (midpoint, separation) for the pinch delta.
+    pinch_prev: Option<((f64, f64), f64)>,
 }
 
 impl AppState {
@@ -438,6 +443,19 @@ impl AppState {
         let (fill_buf, fill_count) = mk(&fills, "tile fills");
         let (line_buf, line_count) = mk(&lines, "tile lines");
         TileMesh { fill_buf, fill_count, line_buf, line_count }
+    }
+
+    /// Reset the pinch reference from the current touch set (called whenever a
+    /// finger lands or lifts), so the next two-finger move has a clean baseline.
+    fn refresh_pinch(&mut self) {
+        if self.touches.len() == 2 {
+            let pts: Vec<(f64, f64)> = self.touches.values().copied().collect();
+            let mid = ((pts[0].0 + pts[1].0) * 0.5, (pts[0].1 + pts[1].1) * 0.5);
+            let dist = (pts[0].0 - pts[1].0).hypot(pts[0].1 - pts[1].1);
+            self.pinch_prev = Some((mid, dist));
+        } else {
+            self.pinch_prev = None;
+        }
     }
 
     fn render(&mut self) {
@@ -578,6 +596,8 @@ impl ApplicationHandler for App {
             cursor: None,
             dragging: false,
             last_cursor: None,
+            touches: HashMap::new(),
+            pinch_prev: None,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -599,19 +619,60 @@ impl ApplicationHandler for App {
                 s.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
-                s.dragging = state == ElementState::Pressed;
+                // Ignore mouse press while a finger is down (touch synthesises it).
+                s.dragging = state == ElementState::Pressed && s.touches.is_empty();
                 s.last_cursor = s.cursor;
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let pos = (position.x, position.y);
                 s.cursor = Some(pos);
-                if s.dragging {
+                if s.dragging && s.touches.is_empty() {
                     if let Some((lx, ly)) = s.last_cursor {
                         s.cam.pan_screen(pos.0 - lx, pos.1 - ly);
                         s.window.request_redraw();
                     }
                 }
                 s.last_cursor = Some(pos);
+            }
+            WindowEvent::Touch(Touch { id, phase, location, .. }) => {
+                let pos = (location.x, location.y);
+                match phase {
+                    TouchPhase::Started => {
+                        s.dragging = false; // a touch cancels any mouse drag
+                        s.touches.insert(id, pos);
+                        s.refresh_pinch();
+                    }
+                    TouchPhase::Moved => {
+                        let prev = s.touches.insert(id, pos);
+                        match s.touches.len() {
+                            1 => {
+                                if let Some((px, py)) = prev {
+                                    s.cam.pan_screen(pos.0 - px, pos.1 - py);
+                                    s.window.request_redraw();
+                                }
+                            }
+                            2 => {
+                                let pts: Vec<(f64, f64)> = s.touches.values().copied().collect();
+                                let mid =
+                                    ((pts[0].0 + pts[1].0) * 0.5, (pts[0].1 + pts[1].1) * 0.5);
+                                let dist = (pts[0].0 - pts[1].0).hypot(pts[0].1 - pts[1].1);
+                                if let Some((pmid, pdist)) = s.pinch_prev {
+                                    // Zoom about the midpoint by the finger-spread
+                                    // ratio, and pan by the midpoint's movement.
+                                    s.cam.zoom_about(dist / pdist.max(1.0), mid.0, mid.1);
+                                    s.cam.pan_screen(mid.0 - pmid.0, mid.1 - pmid.1);
+                                    s.window.request_redraw();
+                                }
+                                s.pinch_prev = Some((mid, dist));
+                            }
+                            _ => {} // 3+ fingers: ignore
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        s.touches.remove(&id);
+                        s.refresh_pinch();
+                    }
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta {

@@ -157,10 +157,13 @@ pub fn visible_peaks<'a>(
     let r_eff = EARTH_RADIUS_M / (1.0 - params.refraction_k);
     let tol = 0.1_f64.to_radians();
 
-    // An obscured summit still counts as "slopes visible" if the ridge blocking
-    // it sits at least this fraction of the way out to the peak (i.e. it's the
-    // fell's own near shoulder rather than a separate fell in front).
-    const SLOPE_FRACTION: f64 = 0.5;
+    // An obscured summit still counts as "slopes visible" when the ridge hiding
+    // it sits within this distance of the summit — i.e. it's the fell's own near
+    // shoulder, so its slopes are in view. A *separate* ridge blocking from much
+    // farther forward hides the whole fell, so that's dropped. Using the absolute
+    // gap (not a ratio) keeps distant fells hidden when a foreground ridge blocks
+    // them, while still catching near fells like Lingmell or Yewbarrow.
+    const MASSIF_GAP_M: f64 = 1500.0;
 
     let mut out = Vec::new();
     for pk in peaks.within_range(viewpoint.lat, viewpoint.lon, params.max_range_m) {
@@ -177,10 +180,10 @@ pub fn visible_peaks<'a>(
 
         let visibility = if elev + tol >= skyline {
             Visibility::Summit
-        } else if horizon.dist_at_bearing_deg(bearing) as f64 >= dist * SLOPE_FRACTION {
-            Visibility::Slopes // summit hidden, but the obscuring ridge is near it
+        } else if dist - horizon.dist_at_bearing_deg(bearing) as f64 <= MASSIF_GAP_M {
+            Visibility::Slopes // summit just behind the fell's own near shoulder
         } else {
-            continue; // fully hidden behind a nearer fell
+            continue; // fully hidden behind a separate, nearer fell
         };
         out.push(VisiblePeak {
             peak: pk,

@@ -83,7 +83,7 @@ const ROAD_WIDTH_TILE: f32 = 22.0;
 /// Label text colours.
 const PLACE_LABEL_COLOR: [f32; 3] = [0.12, 0.10, 0.10]; // settlements/water: near-black
 const PEAK_LABEL_COLOR: [f32; 3] = [0.60, 0.22, 0.0]; // visible summits: burnt orange
-const SLOPE_LABEL_COLOR: [f32; 3] = [0.45, 0.72, 1.0]; // summit hidden, slopes in view: light blue (reads on green terrain)
+const SLOPE_LABEL_COLOR: [f32; 3] = [0.05, 0.18, 0.55]; // summit hidden, slopes in view: dark blue (reads on both sky and terrain)
 
 const DEM_DIR: &str = r"C:\maps\OS Terrain 50";
 
@@ -1112,6 +1112,7 @@ impl AppState {
             pano.viewpoint.lat, pano.viewpoint.lon, pano.ground_m
         );
         self.atlas.layout(&hud, 8.0, 22.0, [0.1, 0.1, 0.1], &mut tv);
+        self.draw_mode_button(&mut tv);
 
         // Upload + draw through the text pipeline; clear to a sky gradient base.
         let tu = [vwf, vhf, 0.0, 0.0];
@@ -1183,6 +1184,40 @@ impl AppState {
             let baseline = y0 + pad + line_h * i as f32 + 13.0;
             let color = if *on { [0.95, 0.95, 0.95] } else { [0.45, 0.45, 0.45] };
             self.atlas.layout(t, x0 + pad, baseline, color, tv);
+        }
+    }
+
+    /// Bottom-left mode-toggle button: returns its screen rect and label.
+    fn mode_button(&self) -> ([f32; 4], &'static str) {
+        let label = match self.mode {
+            Mode::Map => "PANORAMA",
+            Mode::Panorama => "MAP",
+        };
+        let w = self.atlas.measure(label) + 20.0;
+        let h = 32.0;
+        let (x0, y1) = (10.0, self.cam.vh as f32 - 10.0);
+        ([x0, y1 - h, x0 + w, y1], label)
+    }
+
+    fn draw_mode_button(&self, tv: &mut Vec<TextVertex>) {
+        let ([x0, y0, x1, y1], label) = self.mode_button();
+        self.atlas.rect(x0, y0, x1, y1, [0.08, 0.08, 0.10], tv);
+        let tw = self.atlas.measure(label);
+        self.atlas.layout(label, x0 + ((x1 - x0) - tw) * 0.5, y0 + 21.0, [0.95, 0.95, 0.95], tv);
+    }
+
+    fn hit_mode_button(&self, x: f64, y: f64) -> bool {
+        let ([x0, y0, x1, y1], _) = self.mode_button();
+        (x as f32) >= x0 && (x as f32) <= x1 && (y as f32) >= y0 && (y as f32) <= y1
+    }
+
+    fn toggle_mode(&mut self) {
+        match self.mode {
+            Mode::Map => self.enter_panorama(),
+            Mode::Panorama => {
+                self.mode = Mode::Map;
+                self.window.request_redraw();
+            }
         }
     }
 
@@ -1378,6 +1413,7 @@ impl AppState {
             self.atlas.rect(cx - 9.0, cy - 1.5, cx + 9.0, cy + 1.5, red, &mut tv);
             self.atlas.rect(cx - 1.5, cy - 9.0, cx + 1.5, cy + 9.0, red, &mut tv);
         }
+        self.draw_mode_button(&mut tv);
 
         if !tv.is_empty() {
             label_buf = Some(self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1630,6 +1666,15 @@ impl ApplicationHandler for App {
                 s.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
+                // A click on the mode button toggles map/panorama.
+                if state == ElementState::Pressed {
+                    if let Some((cx, cy)) = s.cursor {
+                        if s.hit_mode_button(cx, cy) {
+                            s.toggle_mode();
+                            return;
+                        }
+                    }
+                }
                 // Ignore mouse press while a finger is down (touch synthesises it).
                 s.dragging = state == ElementState::Pressed && s.touches.is_empty();
                 s.last_cursor = s.cursor;
@@ -1658,6 +1703,11 @@ impl ApplicationHandler for App {
                 let pos = (location.x, location.y);
                 match phase {
                     TouchPhase::Started => {
+                        // A tap on the mode button toggles map/panorama.
+                        if s.touches.is_empty() && s.hit_mode_button(pos.0, pos.1) {
+                            s.toggle_mode();
+                            return;
+                        }
                         s.dragging = false; // a touch cancels any mouse drag
                         s.touches.insert(id, pos);
                         s.refresh_pinch();
@@ -1667,7 +1717,16 @@ impl ApplicationHandler for App {
                         match s.touches.len() {
                             1 => {
                                 if let Some((px, py)) = prev {
-                                    s.cam.pan_screen(pos.0 - px, pos.1 - py);
+                                    let (dx, dy) = (pos.0 - px, pos.1 - py);
+                                    match s.mode {
+                                        Mode::Map => s.cam.pan_screen(dx, dy),
+                                        Mode::Panorama => {
+                                            if let Some(p) = s.pano.as_mut() {
+                                                p.center_az = (p.center_az - dx * p.fov_deg / s.cam.vw)
+                                                    .rem_euclid(360.0);
+                                            }
+                                        }
+                                    }
                                     s.window.request_redraw();
                                 }
                             }
@@ -1677,10 +1736,25 @@ impl ApplicationHandler for App {
                                     ((pts[0].0 + pts[1].0) * 0.5, (pts[0].1 + pts[1].1) * 0.5);
                                 let dist = (pts[0].0 - pts[1].0).hypot(pts[0].1 - pts[1].1);
                                 if let Some((pmid, pdist)) = s.pinch_prev {
-                                    // Zoom about the midpoint by the finger-spread
-                                    // ratio, and pan by the midpoint's movement.
-                                    s.cam.zoom_about(dist / pdist.max(1.0), mid.0, mid.1);
-                                    s.cam.pan_screen(mid.0 - pmid.0, mid.1 - pmid.1);
+                                    match s.mode {
+                                        Mode::Map => {
+                                            // Zoom about the midpoint by the finger-spread
+                                            // ratio, and pan by the midpoint's movement.
+                                            s.cam.zoom_about(dist / pdist.max(1.0), mid.0, mid.1);
+                                            s.cam.pan_screen(mid.0 - pmid.0, mid.1 - pmid.1);
+                                        }
+                                        Mode::Panorama => {
+                                            if let Some(p) = s.pano.as_mut() {
+                                                // Pinch apart -> narrower FOV (zoom in);
+                                                // midpoint drag scrubs azimuth.
+                                                p.fov_deg = (p.fov_deg * pdist.max(1.0) / dist.max(1.0))
+                                                    .clamp(20.0, 160.0);
+                                                p.center_az = (p.center_az
+                                                    - (mid.0 - pmid.0) * p.fov_deg / s.cam.vw)
+                                                    .rem_euclid(360.0);
+                                            }
+                                        }
+                                    }
                                     s.window.request_redraw();
                                 }
                                 s.pinch_prev = Some((mid, dist));
@@ -1723,8 +1797,9 @@ fn main() {
     let path = args
         .next()
         .unwrap_or_else(|| r"C:\maps\airhorizon\data\OS_Open_Zoomstack.mbtiles".to_string());
-    let lat: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(54.6012);
-    let lon: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(-3.1399);
+    // Default to Wasdale Head Inn (NY187088, valley floor ~81 m).
+    let lat: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(54.4679);
+    let lon: f64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(-3.2559);
 
     let mut app = App {
         path: path.into(),

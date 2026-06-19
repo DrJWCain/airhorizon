@@ -112,7 +112,7 @@ struct PanoState {
     center_az: f64,
     fov_deg: f64,
     skyline: Vec<f32>, // horizon::AZIMUTH_BUCKETS elevation angles (radians)
-    edges: Vec<Vec<f32>>, // occlusion-edge elevation angles per azimuth bucket
+    edge_lines: Vec<Vec<(f32, f32)>>, // linked occlusion edges: (azimuth_deg, elev_rad)
     peaks: Vec<PanoPeak>,
 }
 
@@ -619,6 +619,7 @@ struct AppState {
     mode: Mode,
     dem: Option<Dem>,
     pano: Option<PanoState>,
+    show_edges: bool,
 }
 
 /// Build the text rendering resources: upload the atlas as an R8 texture and
@@ -1016,8 +1017,8 @@ impl AppState {
             ground_m: h.eye_ground_m,
             center_az,
             fov_deg: 90.0,
+            edge_lines: h.edge_polylines(),
             skyline: h.elev_rad,
-            edges: h.edges,
             peaks,
         });
         self.mode = Mode::Panorama;
@@ -1074,17 +1075,26 @@ impl AppState {
         tri(0.0, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 - 0.6, [0.5, 0.55, 0.6]);
         tri(vwf, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 + 0.6, [0.5, 0.55, 0.6]);
 
-        // Wainwright-style occlusion edges: a dot per azimuth where a near ridge
-        // ends and a farther fell shows behind it. Across azimuths they read as
-        // dotted edge-lines below the skyline. (Raw points for now — no linking.)
-        let edge_c = [0.18, 0.18, 0.20];
-        for b in start..=end {
-            let bucket = b.rem_euclid(buckets) as usize;
-            let x = az_to_x(b as f64 * 0.1);
-            for &ea in &pano.edges[bucket] {
-                let y = elev_to_y((ea as f64).to_degrees());
-                tri(x - 1.0, y - 1.0, x - 1.0, y + 1.0, x + 1.0, y - 1.0, edge_c);
-                tri(x + 1.0, y - 1.0, x - 1.0, y + 1.0, x + 1.0, y + 1.0, edge_c);
+        // Wainwright-style occlusion edges, linked into lines: where a near ridge
+        // ends and a farther fell shows behind it, traced across azimuths.
+        if self.show_edges {
+            let edge_c = [0.18, 0.18, 0.20];
+            for line in &pano.edge_lines {
+                for w in line.windows(2) {
+                    let x0 = az_to_x(w[0].0 as f64);
+                    let x1 = az_to_x(w[1].0 as f64);
+                    if (x1 - x0).abs() > vwf {
+                        continue; // crosses the ±180° seam
+                    }
+                    if x0.max(x1) < -2.0 || x0.min(x1) > vwf + 2.0 {
+                        continue; // off-screen
+                    }
+                    let y0 = elev_to_y((w[0].1 as f64).to_degrees());
+                    let y1 = elev_to_y((w[1].1 as f64).to_degrees());
+                    let t = 0.8;
+                    tri(x0, y0 - t, x0, y0 + t, x1, y1 - t, edge_c);
+                    tri(x1, y1 - t, x0, y0 + t, x1, y1 + t, edge_c);
+                }
             }
         }
 
@@ -1124,7 +1134,7 @@ impl AppState {
 
         // HUD hint.
         let hud = format!(
-            "PANORAMA  ({:.4}, {:.4})  ground {:.0} m   (V: map, drag: scrub, wheel: zoom, N: names)",
+            "PANORAMA  ({:.4}, {:.4})  ground {:.0} m   (V: map, drag: scrub, wheel: zoom, N: names, E: edges)",
             pano.viewpoint.lat, pano.viewpoint.lon, pano.ground_m
         );
         self.atlas.layout(&hud, 8.0, 22.0, [0.1, 0.1, 0.1], &mut tv);
@@ -1596,6 +1606,7 @@ impl ApplicationHandler for App {
             mode: Mode::Map,
             dem: None,
             pano: None,
+            show_edges: true,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -1627,6 +1638,14 @@ impl ApplicationHandler for App {
                         s.window.request_redraw();
                     }
                 }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyE) =>
+            {
+                s.show_edges = !s.show_edges;
+                s.window.request_redraw();
+                println!("ridge edges: {}", if s.show_edges { "on" } else { "off" });
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed

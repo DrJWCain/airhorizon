@@ -48,10 +48,10 @@ pub struct Horizon {
     /// Horizontal distance (m) at which each bucket's skyline point sits — i.e.
     /// how far away the ridge forming the horizon in that direction is.
     pub dist_m: Vec<f32>,
-    /// Per azimuth bucket: elevation angles (radians) of *occlusion edges* below
-    /// the skyline — nearer ridge crests that are superseded by a much farther,
+    /// Per azimuth bucket: (elevation radians, distance m) of *occlusion edges*
+    /// below the skyline — nearer ridge crests superseded by a much farther,
     /// higher fell behind them (Wainwright's "edge of one fell reveals the next").
-    pub edges: Vec<Vec<f32>>,
+    pub edges: Vec<Vec<(f32, f32)>>,
     /// Ground elevation sampled at the viewpoint (m).
     pub eye_ground_m: f64,
 }
@@ -69,6 +69,82 @@ impl Horizon {
 
     fn bucket(deg: f64) -> usize {
         (deg.rem_euclid(360.0) * 10.0).round() as usize % AZIMUTH_BUCKETS
+    }
+
+    /// Trace the per-azimuth occlusion edge points into polylines by greedily
+    /// chaining edges that continue (similar elevation and reveal-distance) into
+    /// the next azimuth. Returns lines of `(azimuth_deg, elev_rad)`; short noisy
+    /// chains are dropped.
+    pub fn edge_polylines(&self) -> Vec<Vec<(f32, f32)>> {
+        struct Chain {
+            pts: Vec<(f32, f32)>, // (az_deg, elev_rad)
+            elev: f32,
+            dist: f32,
+            last_az: i32,
+        }
+        const ELEV_TOL: f32 = 0.015; // rad (~0.86°) allowed step between azimuths
+        const DIST_TOL_FRAC: f32 = 0.30;
+        const MAX_AZ_GAP: i32 = 4; // buckets (0.4°)
+        const MIN_LEN: usize = 3;
+
+        let mut chains: Vec<Chain> = Vec::new();
+        let mut done: Vec<Vec<(f32, f32)>> = Vec::new();
+
+        for b in 0..AZIMUTH_BUCKETS {
+            let az = b as f32 * 0.1;
+            // Only match against chains that existed before this bucket (new ones
+            // appended below mustn't be matched again, or re-indexed, this pass).
+            let n0 = chains.len();
+            let mut used = vec![false; n0];
+            for &(elev, dist) in &self.edges[b] {
+                // Best matching active chain.
+                let mut best: Option<usize> = None;
+                let mut best_score = f32::MAX;
+                for (ci, ch) in chains.iter().enumerate().take(n0) {
+                    if used[ci] || b as i32 - ch.last_az > MAX_AZ_GAP {
+                        continue;
+                    }
+                    let de = (ch.elev - elev).abs();
+                    let dd = (ch.dist - dist).abs() / ch.dist.max(1.0);
+                    if de < ELEV_TOL && dd < DIST_TOL_FRAC {
+                        let score = de / ELEV_TOL + dd / DIST_TOL_FRAC;
+                        if score < best_score {
+                            best_score = score;
+                            best = Some(ci);
+                        }
+                    }
+                }
+                match best {
+                    Some(ci) => {
+                        chains[ci].pts.push((az, elev));
+                        chains[ci].elev = elev;
+                        chains[ci].dist = dist;
+                        chains[ci].last_az = b as i32;
+                        used[ci] = true;
+                    }
+                    None => chains.push(Chain { pts: vec![(az, elev)], elev, dist, last_az: b as i32 }),
+                }
+            }
+            // Retire chains that didn't continue.
+            let cutoff = b as i32 - MAX_AZ_GAP;
+            let mut i = 0;
+            while i < chains.len() {
+                if chains[i].last_az < cutoff {
+                    let ch = chains.remove(i);
+                    if ch.pts.len() >= MIN_LEN {
+                        done.push(ch.pts);
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        for ch in chains {
+            if ch.pts.len() >= MIN_LEN {
+                done.push(ch.pts);
+            }
+        }
+        done
     }
 
     /// The highest skyline point: (bearing °, elevation °).
@@ -98,7 +174,7 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
 
     let mut elev = vec![(-PI / 2.0) as f32; AZIMUTH_BUCKETS];
     let mut dist = vec![0.0f32; AZIMUTH_BUCKETS];
-    let mut edges: Vec<Vec<f32>> = vec![Vec::new(); AZIMUTH_BUCKETS];
+    let mut edges: Vec<Vec<(f32, f32)>> = vec![Vec::new(); AZIMUTH_BUCKETS];
     for i in 0..AZIMUTH_BUCKETS {
         let az = i as f64 * 0.1 * PI / 180.0;
         let (dx, dy) = (az.sin(), az.cos()); // BNG east, north
@@ -114,7 +190,7 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
                     // The crest we're leaving behind is a visible edge if the new,
                     // higher crest sits well beyond it.
                     if best_d > 0.0 && d - best_d > EDGE_DEPTH_JUMP_M {
-                        edges[i].push(max_elev as f32);
+                        edges[i].push((max_elev as f32, best_d as f32));
                     }
                     max_elev = elev_angle;
                     best_d = d;

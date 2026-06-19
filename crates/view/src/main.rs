@@ -12,6 +12,7 @@ use std::sync::Arc;
 use basemap::{GeomKind, Mbtiles};
 use bytemuck::{Pod, Zeroable};
 use geodesy::{LatLon, Tile, MERCATOR_MAX};
+use mapdata::{load_paths, PathKind};
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{BuffersBuilder, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers};
@@ -386,6 +387,12 @@ struct AppState {
     pinch_prev: Option<((f64, f64), f64)>,
     /// Layer visibility toggles (R toggles roads).
     show_roads: bool,
+    /// OSM footpaths overlay, lazily loaded on first P press.
+    paths_pbf: std::path::PathBuf,
+    paths_loaded: bool,
+    show_paths: bool,
+    path_buf: Option<wgpu::Buffer>,
+    path_count: u32,
 }
 
 impl AppState {
@@ -497,6 +504,64 @@ impl AppState {
         }
     }
 
+    /// Load the OSM footpath overlay once: extract paths, project to
+    /// Mercator-relative, tessellate to thick strokes coloured by kind, upload
+    /// one buffer. Width is fixed in Mercator metres (sized for the current
+    /// zoom), so paths scale with zoom for now — fine for a first cut.
+    fn ensure_paths_loaded(&mut self) {
+        if self.paths_loaded {
+            return;
+        }
+        self.paths_loaded = true;
+        let t = std::time::Instant::now();
+        let ways = match load_paths(&self.paths_pbf) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("paths: load failed: {e}");
+                return;
+            }
+        };
+        let (ox, oy) = (self.cam.origin_x, self.cam.origin_y);
+        // ~1 px wide at the zoom paths are loaded at (they scale with zoom).
+        let width = (1.0 / self.cam.zoom).max(0.4) as f32;
+        let mut tess = StrokeTessellator::new();
+        let mut verts: Vec<Vertex> = Vec::new();
+        for w in &ways {
+            let color = match w.kind {
+                PathKind::Foot => [0.10, 0.45, 0.18],
+                PathKind::Bridleway => [0.55, 0.25, 0.62],
+                PathKind::Track => [0.45, 0.32, 0.16],
+            };
+            let merc: Vec<[f32; 2]> = w
+                .points
+                .iter()
+                .map(|&(lat, lon)| {
+                    let m = LatLon::new(lat, lon).to_mercator();
+                    [(m.x - ox) as f32, (m.y - oy) as f32]
+                })
+                .collect();
+            for p in stroke_to_tris(&mut tess, &merc, width) {
+                verts.push(Vertex { pos: p, color });
+            }
+        }
+        if !verts.is_empty() {
+            self.path_buf = Some(self.gpu.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label: Some("paths"),
+                    contents: bytemuck::cast_slice(&verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                },
+            ));
+            self.path_count = verts.len() as u32;
+        }
+        println!(
+            "paths: {} ways -> {} verts in {:.1}s",
+            ways.len(),
+            verts.len(),
+            t.elapsed().as_secs_f32()
+        );
+    }
+
     fn render(&mut self) {
         let z = self.cam.slippy_zoom(self.maxzoom);
         let ((tx0, ty0), (tx1, ty1)) = self.cam.visible_tiles(z);
@@ -591,6 +656,15 @@ impl AppState {
                     pass.draw(0..*stroke_count, 0..1);
                 }
             }
+            // OSM footpaths overlay, above everything.
+            if self.show_paths {
+                if let Some(buf) = &self.path_buf {
+                    if self.path_count > 0 {
+                        pass.set_vertex_buffer(0, buf.slice(..));
+                        pass.draw(0..self.path_count, 0..1);
+                    }
+                }
+            }
         }
         self.gpu.queue.submit(Some(enc.finish()));
         frame.present();
@@ -603,6 +677,7 @@ impl AppState {
 
 struct App {
     path: std::path::PathBuf,
+    paths_pbf: std::path::PathBuf,
     at: LatLon,
     state: Option<AppState>,
 }
@@ -637,6 +712,11 @@ impl ApplicationHandler for App {
             touches: HashMap::new(),
             pinch_prev: None,
             show_roads: true,
+            paths_pbf: self.paths_pbf.clone(),
+            paths_loaded: false,
+            show_paths: false,
+            path_buf: None,
+            path_count: 0,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -659,6 +739,20 @@ impl ApplicationHandler for App {
                 s.tiles.clear(); // rebuild meshes with/without the roads layer
                 s.window.request_redraw();
                 println!("roads: {}", if s.show_roads { "on" } else { "off" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyP) =>
+            {
+                if !s.paths_loaded {
+                    println!("paths: loading...");
+                    s.ensure_paths_loaded();
+                    s.show_paths = true;
+                } else {
+                    s.show_paths = !s.show_paths;
+                }
+                s.window.request_redraw();
+                println!("paths: {}", if s.show_paths { "on" } else { "off" });
             }
             WindowEvent::Resized(new) => {
                 s.gpu.resize(new.width, new.height);
@@ -747,6 +841,7 @@ fn main() {
 
     let mut app = App {
         path: path.into(),
+        paths_pbf: r"C:\maps\airhorizon\data\cumbria-latest.osm.pbf".into(),
         at: LatLon::new(lat, lon),
         state: None,
     };

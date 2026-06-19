@@ -2336,6 +2336,7 @@ dependencies = [
  "earcutr",
  "geodesy",
  "lyon",
+ "mapdata",
  "pollster",
  "wgpu",
  "winit",

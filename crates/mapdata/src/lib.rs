@@ -88,16 +88,55 @@ pub fn load_paths(pbf: impl AsRef<Path>) -> Result<Vec<PathWay>, osmpbf::Error> 
         _ => {}
     })?;
 
-    // Stitch node ids into coordinate polylines.
-    let mut out = Vec::with_capacity(ways.len());
+    // Stitch node ids into coordinate polylines. Break the line wherever a node
+    // coordinate is missing (extract gap) or two consecutive nodes are
+    // implausibly far apart (also a gap) — otherwise we'd draw a straight
+    // shortcut across the terrain. Each unbroken run becomes its own PathWay.
+    let mut out = Vec::new();
+    let mut run: Vec<(f64, f64)> = Vec::new();
     for (kind, refs) in ways {
-        let points: Vec<(f64, f64)> =
-            refs.iter().filter_map(|r| coords.get(r).copied()).collect();
-        if points.len() >= 2 {
-            out.push(PathWay { kind, points });
+        run.clear();
+        for r in &refs {
+            match coords.get(r) {
+                Some(&c) => {
+                    let gap = run
+                        .last()
+                        .map(|&last| haversine_m(last, c) > MAX_SEGMENT_M)
+                        .unwrap_or(false);
+                    if gap {
+                        flush_run(&mut out, kind, &mut run);
+                    }
+                    run.push(c);
+                }
+                None => flush_run(&mut out, kind, &mut run), // missing node: break
+            }
         }
+        flush_run(&mut out, kind, &mut run);
     }
     Ok(out)
+}
+
+/// A single straight segment longer than this (metres) is treated as a sparse-
+/// mapping artifact / extract gap rather than a real path, and breaks the
+/// polyline (better a small gap than a straight line drawn across the terrain).
+const MAX_SEGMENT_M: f64 = 400.0;
+
+fn flush_run(out: &mut Vec<PathWay>, kind: PathKind, run: &mut Vec<(f64, f64)>) {
+    if run.len() >= 2 {
+        out.push(PathWay { kind, points: std::mem::take(run) });
+    } else {
+        run.clear();
+    }
+}
+
+/// Great-circle distance in metres (spherical earth).
+fn haversine_m(a: (f64, f64), b: (f64, f64)) -> f64 {
+    let r = 6_371_000.0;
+    let (lat1, lat2) = (a.0.to_radians(), b.0.to_radians());
+    let dlat = (b.0 - a.0).to_radians();
+    let dlon = (b.1 - a.1).to_radians();
+    let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
+    2.0 * r * h.sqrt().asin()
 }
 
 #[cfg(test)]

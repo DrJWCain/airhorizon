@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/geodesy",
     "crates/basemap",
+    "crates/mapdata",
     "crates/view",
 ]
 

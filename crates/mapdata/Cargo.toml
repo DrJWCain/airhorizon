@@ -1,0 +1,10 @@
+[package]
+name = "mapdata"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Extract walker features (footpaths, bridleways, tracks) from an OSM .pbf extract. The layer OS open data lacks."
+
+[dependencies]
+osmpbf = "0.3"

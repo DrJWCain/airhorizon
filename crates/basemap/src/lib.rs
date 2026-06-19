@@ -1,13 +1,14 @@
 //! Read OS Open Zoomstack (or any vector MBTiles) and decode Mapbox Vector
-//! Tiles to a typed-feature summary.
+//! Tiles to typed geometry in tile-local coordinates.
 //!
 //! MBTiles is a SQLite database: a `tiles(zoom_level, tile_column, tile_row,
 //! tile_data)` table plus a `metadata(name, value)` table. Rows are stored
 //! TMS-flipped (bottom-up), so we go through [`geodesy::Tile::tms_y`]. Each
 //! `tile_data` blob is a gzip-compressed MVT (protobuf).
 //!
-//! Like qct-viewer's `qct` crate, this stays GPU-unaware: it hands back
-//! geometry/attributes; tessellation and upload live in the renderer.
+//! Geometry comes back in tile-local integer space (0..=`extent`, usually 4096);
+//! the renderer maps it to Web Mercator via [`geodesy::Tile::mvt_to_mercator`].
+//! Like qct-viewer's `qct` crate, this stays GPU-unaware.
 
 use std::io::Read;
 use std::path::Path;
@@ -43,29 +44,63 @@ pub struct Metadata {
     pub bounds: Option<String>,
 }
 
-/// Per-layer summary of a decoded tile.
+/// Geometry kind of a decoded feature.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GeomKind {
+    Point,
+    Line,
+    Polygon,
+    Unknown,
+}
+
+impl GeomKind {
+    fn from_mvt(t: i32) -> Self {
+        match t {
+            1 => GeomKind::Point,
+            2 => GeomKind::Line,
+            3 => GeomKind::Polygon,
+            _ => GeomKind::Unknown,
+        }
+    }
+}
+
+/// One feature: its geometry kind and parts. Each "part" is a ring (polygon),
+/// a polyline (line), or a run of points, in tile-local coordinates.
 #[derive(Debug, Clone)]
-pub struct LayerSummary {
+pub struct Feature {
+    pub kind: GeomKind,
+    pub parts: Vec<Vec<[f32; 2]>>,
+}
+
+/// One layer's decoded features plus its attribute-key dictionary.
+#[derive(Debug, Clone)]
+pub struct Layer {
     pub name: String,
     pub version: u32,
     pub extent: u32,
-    pub features: usize,
-    pub points: usize,
-    pub lines: usize,
-    pub polygons: usize,
-    /// Attribute keys present in the layer's dictionary.
     pub keys: Vec<String>,
+    pub features: Vec<Feature>,
 }
 
-/// A decoded tile reduced to per-layer summaries.
+impl Layer {
+    pub fn count(&self, kind: GeomKind) -> usize {
+        self.features.iter().filter(|f| f.kind == kind).count()
+    }
+}
+
+/// A fully decoded vector tile.
 #[derive(Debug, Clone)]
-pub struct DecodedTile {
-    pub layers: Vec<LayerSummary>,
+pub struct VectorTile {
+    pub layers: Vec<Layer>,
 }
 
-impl DecodedTile {
+impl VectorTile {
     pub fn total_features(&self) -> usize {
-        self.layers.iter().map(|l| l.features).sum()
+        self.layers.iter().map(|l| l.features.len()).sum()
+    }
+
+    pub fn layer(&self, name: &str) -> Option<&Layer> {
+        self.layers.iter().find(|l| l.name == name)
     }
 }
 
@@ -113,9 +148,9 @@ impl Mbtiles {
         Ok(blob)
     }
 
-    /// Fetch, decompress and MVT-decode a tile into a per-layer summary.
+    /// Fetch, decompress and MVT-decode a tile into typed geometry.
     /// `None` if the tile is absent.
-    pub fn decode_tile(&self, tile: Tile) -> Result<Option<DecodedTile>> {
+    pub fn decode_tile(&self, tile: Tile) -> Result<Option<VectorTile>> {
         let Some(raw) = self.raw_tile(tile)? else {
             return Ok(None);
         };
@@ -124,29 +159,85 @@ impl Mbtiles {
 
         let mut layers = Vec::with_capacity(mvt.layers.len());
         for l in &mvt.layers {
-            let (mut points, mut lines, mut polygons) = (0usize, 0usize, 0usize);
-            for f in &l.features {
-                // GeomType: 1 = Point, 2 = LineString, 3 = Polygon.
-                match f.r#type.unwrap_or(0) {
-                    1 => points += 1,
-                    2 => lines += 1,
-                    3 => polygons += 1,
-                    _ => {}
-                }
-            }
-            layers.push(LayerSummary {
+            let extent = l.extent.unwrap_or(geodesy::TILE_EXTENT);
+            let features = l
+                .features
+                .iter()
+                .map(|f| Feature {
+                    kind: GeomKind::from_mvt(f.r#type.unwrap_or(0)),
+                    parts: decode_geometry(&f.geometry),
+                })
+                .collect();
+            layers.push(Layer {
                 name: l.name.clone(),
                 version: l.version,
-                extent: l.extent.unwrap_or(geodesy::TILE_EXTENT),
-                features: l.features.len(),
-                points,
-                lines,
-                polygons,
+                extent,
                 keys: l.keys.clone(),
+                features,
             });
         }
-        Ok(Some(DecodedTile { layers }))
+        Ok(Some(VectorTile { layers }))
     }
+}
+
+/// Decode an MVT geometry command stream (MVT spec §4.3) into parts of
+/// tile-local points. MoveTo starts a new part; LineTo extends it; ClosePath
+/// closes a polygon ring back to its start.
+fn decode_geometry(geom: &[u32]) -> Vec<Vec<[f32; 2]>> {
+    let mut parts: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut cur: Vec<[f32; 2]> = Vec::new();
+    let (mut x, mut y) = (0i32, 0i32);
+    let mut i = 0usize;
+    while i < geom.len() {
+        let cmd = geom[i] & 0x7;
+        let count = (geom[i] >> 3) as usize;
+        i += 1;
+        match cmd {
+            1 => {
+                // MoveTo: each point begins a new part.
+                for _ in 0..count {
+                    if i + 1 >= geom.len() {
+                        break;
+                    }
+                    x += zigzag(geom[i]);
+                    y += zigzag(geom[i + 1]);
+                    i += 2;
+                    if !cur.is_empty() {
+                        parts.push(std::mem::take(&mut cur));
+                    }
+                    cur.push([x as f32, y as f32]);
+                }
+            }
+            2 => {
+                // LineTo: extend the current part.
+                for _ in 0..count {
+                    if i + 1 >= geom.len() {
+                        break;
+                    }
+                    x += zigzag(geom[i]);
+                    y += zigzag(geom[i + 1]);
+                    i += 2;
+                    cur.push([x as f32, y as f32]);
+                }
+            }
+            7 => {
+                // ClosePath: close the ring back to its first vertex (no params).
+                if let Some(&first) = cur.first() {
+                    cur.push(first);
+                }
+            }
+            _ => break, // unknown command — stop to avoid desync
+        }
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+/// MVT zig-zag decode: maps an unsigned parameter back to a signed delta.
+fn zigzag(n: u32) -> i32 {
+    ((n >> 1) as i32) ^ (-((n & 1) as i32))
 }
 
 /// Gzip-decompress if the blob carries the gzip magic (1f 8b); otherwise return
@@ -163,20 +254,49 @@ fn maybe_gunzip(bytes: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::maybe_gunzip;
+    use super::*;
     use std::io::Write;
 
     #[test]
     fn gunzips_gzip_blobs_and_passes_through_raw() {
         let payload = b"vector tile bytes";
-        // Round-trip through gzip -> maybe_gunzip recovers the payload.
         let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         enc.write_all(payload).unwrap();
         let gz = enc.finish().unwrap();
-        assert_eq!(gz[0], 0x1f);
-        assert_eq!(gz[1], 0x8b);
+        assert_eq!(&gz[0..2], &[0x1f, 0x8b]);
         assert_eq!(maybe_gunzip(&gz).unwrap(), payload);
-        // A non-gzip blob (no magic) is returned untouched.
         assert_eq!(maybe_gunzip(payload).unwrap(), payload);
+    }
+
+    #[test]
+    fn decodes_mvt_point_example() {
+        // MVT spec worked example: a point at (25, 17): [MoveTo(1), 25, 17].
+        let parts = decode_geometry(&[9, 50, 34]);
+        assert_eq!(parts, vec![vec![[25.0, 17.0]]]);
+    }
+
+    #[test]
+    fn decodes_mvt_linestring_example() {
+        // MVT spec: MoveTo (2,2) then LineTo (2,10),(10,10).
+        // [MoveTo(1), +2,+2, LineTo(2), +0,+8, +8,+0]
+        let parts = decode_geometry(&[9, 4, 4, 18, 0, 16, 16, 0]);
+        assert_eq!(parts, vec![vec![[2.0, 2.0], [2.0, 10.0], [10.0, 10.0]]]);
+    }
+
+    #[test]
+    fn closepath_closes_ring() {
+        // Triangle: MoveTo(0,0) LineTo(8,0),(0,8) ClosePath -> first vertex re-added.
+        let parts = decode_geometry(&[9, 0, 0, 18, 16, 0, 0, 16, 15]);
+        assert_eq!(
+            parts,
+            vec![vec![[0.0, 0.0], [8.0, 0.0], [8.0, 8.0], [0.0, 0.0]]]
+        );
+    }
+
+    #[test]
+    fn multiple_moveto_split_into_parts() {
+        // Two separate single-point parts.
+        let parts = decode_geometry(&[9, 2, 2, 9, 2, 2]);
+        assert_eq!(parts.len(), 2);
     }
 }

@@ -1,11 +1,11 @@
-//! Decode one Zoomstack tile and print its layers — a smoke test for B2.
+//! Decode one Zoomstack tile and print its layers — a smoke test for B2/B3a.
 //!
 //!   cargo run -p basemap --example dump_tile --offline
 //!   cargo run -p basemap --example dump_tile --offline -- <mbtiles> <lat> <lon> <zoom>
 //!
 //! Defaults to the downloaded Zoomstack pack centred on Keswick.
 
-use basemap::Mbtiles;
+use basemap::{GeomKind, Mbtiles};
 use geodesy::{LatLon, Tile};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,8 +21,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let meta = mbt.metadata()?;
     println!("== {path}");
     println!(
-        "metadata: name={:?} format={:?} zoom={:?}..{:?} bounds={:?}",
-        meta.name, meta.format, meta.minzoom, meta.maxzoom, meta.bounds
+        "metadata: name={:?} format={:?} zoom={:?}..{:?}",
+        meta.name, meta.format, meta.minzoom, meta.maxzoom
     );
 
     let zoom = want_zoom
@@ -39,18 +39,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match mbt.decode_tile(tile)? {
         None => println!("(no tile stored here — try a different zoom or location)"),
-        Some(dec) => {
-            println!("{} layers, {} features total:", dec.layers.len(), dec.total_features());
-            for l in &dec.layers {
+        Some(vt) => {
+            println!("{} layers, {} features total:", vt.layers.len(), vt.total_features());
+            for l in &vt.layers {
+                // Sanity: confirm decoded coords sit within the tile extent.
+                let mut max_c = 0f32;
+                for f in &l.features {
+                    for part in &f.parts {
+                        for p in part {
+                            max_c = max_c.max(p[0].abs()).max(p[1].abs());
+                        }
+                    }
+                }
                 println!(
-                    "  {:<16} v{} extent={} feats={:<5} (pt {}, line {}, poly {})  keys: {}",
+                    "  {:<16} extent={} feats={:<5} (pt {}, line {}, poly {})  max|coord|={:.0}  keys: {}",
                     l.name,
-                    l.version,
                     l.extent,
-                    l.features,
-                    l.points,
-                    l.lines,
-                    l.polygons,
+                    l.features.len(),
+                    l.count(GeomKind::Point),
+                    l.count(GeomKind::Line),
+                    l.count(GeomKind::Polygon),
+                    max_c,
                     l.keys.join(", ")
                 );
             }

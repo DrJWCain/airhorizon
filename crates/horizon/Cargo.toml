@@ -1,0 +1,11 @@
+[package]
+name = "horizon"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Geometric horizon ray-caster: sweep a DEM to produce the apparent skyline elevation per azimuth. CPU reference; a WGSL compute port comes later."
+
+[dependencies]
+geodesy = { path = "../geodesy" }
+dem = { path = "../dem" }

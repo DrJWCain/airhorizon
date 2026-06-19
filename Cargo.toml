@@ -5,6 +5,8 @@ members = [
     "crates/basemap",
     "crates/mapdata",
     "crates/peaks",
+    "crates/dem",
+    "crates/horizon",
     "crates/view",
 ]
 

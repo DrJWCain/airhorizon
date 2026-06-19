@@ -1,0 +1,12 @@
+[package]
+name = "dem"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "UK Digital Elevation Model: OS Terrain 50 ASCII Grid lookup, by WGS84 or BNG, with a tile cache. Ported from qct-viewer; BNG via the geodesy crate."
+
+[dependencies]
+geodesy = { path = "../geodesy" }
+walkdir = "2"
+thiserror = "1"

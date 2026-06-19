@@ -1,0 +1,15 @@
+[package]
+name = "basemap"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Read OS Open Zoomstack MBTiles and decode Mapbox Vector Tiles to typed features. No GPU awareness."
+
+[dependencies]
+geodesy = { path = "../geodesy" }
+rusqlite = { version = "0.32", features = ["bundled"] }   # MBTiles is SQLite; bundled = no system sqlite
+flate2 = "1"                                              # MVT blobs are gzip-compressed in MBTiles
+geozero = { version = "0.13", features = ["with-mvt"] }   # MVT (vector_tile) prost message types
+prost = "0.11"                                            # MUST match geozero 0.13's prost for Tile::decode
+thiserror = "1"

@@ -112,6 +112,7 @@ struct PanoState {
     center_az: f64,
     fov_deg: f64,
     skyline: Vec<f32>, // horizon::AZIMUTH_BUCKETS elevation angles (radians)
+    edges: Vec<Vec<f32>>, // occlusion-edge elevation angles per azimuth bucket
     peaks: Vec<PanoPeak>,
 }
 
@@ -1016,6 +1017,7 @@ impl AppState {
             center_az,
             fov_deg: 90.0,
             skyline: h.elev_rad,
+            edges: h.edges,
             peaks,
         });
         self.mode = Mode::Panorama;
@@ -1071,6 +1073,20 @@ impl AppState {
         let y0 = elev_to_y(0.0);
         tri(0.0, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 - 0.6, [0.5, 0.55, 0.6]);
         tri(vwf, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 + 0.6, [0.5, 0.55, 0.6]);
+
+        // Wainwright-style occlusion edges: a dot per azimuth where a near ridge
+        // ends and a farther fell shows behind it. Across azimuths they read as
+        // dotted edge-lines below the skyline. (Raw points for now — no linking.)
+        let edge_c = [0.18, 0.18, 0.20];
+        for b in start..=end {
+            let bucket = b.rem_euclid(buckets) as usize;
+            let x = az_to_x(b as f64 * 0.1);
+            for &ea in &pano.edges[bucket] {
+                let y = elev_to_y((ea as f64).to_degrees());
+                tri(x - 1.0, y - 1.0, x - 1.0, y + 1.0, x + 1.0, y - 1.0, edge_c);
+                tri(x + 1.0, y - 1.0, x - 1.0, y + 1.0, x + 1.0, y + 1.0, edge_c);
+            }
+        }
 
         // Cardinal marks along the bottom.
         for (az, lbl) in [

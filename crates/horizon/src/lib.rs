@@ -48,6 +48,10 @@ pub struct Horizon {
     /// Horizontal distance (m) at which each bucket's skyline point sits — i.e.
     /// how far away the ridge forming the horizon in that direction is.
     pub dist_m: Vec<f32>,
+    /// Per azimuth bucket: elevation angles (radians) of *occlusion edges* below
+    /// the skyline — nearer ridge crests that are superseded by a much farther,
+    /// higher fell behind them (Wainwright's "edge of one fell reveals the next").
+    pub edges: Vec<Vec<f32>>,
     /// Ground elevation sampled at the viewpoint (m).
     pub eye_ground_m: f64,
 }
@@ -87,8 +91,14 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
     let h_eye = ground + params.eye_height_m;
     let r_eff = EARTH_RADIUS_M / (1.0 - params.refraction_k);
 
+    // A near ridge crest is recorded as an occlusion edge when it's superseded
+    // by a higher crest at least this much farther out (you see past it to a
+    // distant fell). Tune for how "Wainwright" the edges look.
+    const EDGE_DEPTH_JUMP_M: f64 = 2000.0;
+
     let mut elev = vec![(-PI / 2.0) as f32; AZIMUTH_BUCKETS];
     let mut dist = vec![0.0f32; AZIMUTH_BUCKETS];
+    let mut edges: Vec<Vec<f32>> = vec![Vec::new(); AZIMUTH_BUCKETS];
     for i in 0..AZIMUTH_BUCKETS {
         let az = i as f64 * 0.1 * PI / 180.0;
         let (dx, dy) = (az.sin(), az.cos()); // BNG east, north
@@ -101,6 +111,11 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
                 let curve_drop = d * d / (2.0 * r_eff);
                 let elev_angle = ((h_t - h_eye - curve_drop) / d).atan();
                 if elev_angle > max_elev {
+                    // The crest we're leaving behind is a visible edge if the new,
+                    // higher crest sits well beyond it.
+                    if best_d > 0.0 && d - best_d > EDGE_DEPTH_JUMP_M {
+                        edges[i].push(max_elev as f32);
+                    }
                     max_elev = elev_angle;
                     best_d = d;
                 }
@@ -113,7 +128,7 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
         dist[i] = best_d as f32;
     }
 
-    Some(Horizon { elev_rad: elev, dist_m: dist, eye_ground_m: ground })
+    Some(Horizon { elev_rad: elev, dist_m: dist, edges, eye_ground_m: ground })
 }
 
 /// How much of a fell can be seen from the viewpoint.

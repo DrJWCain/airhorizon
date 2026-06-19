@@ -10,12 +10,14 @@ use std::collections::HashMap;
 use bytemuck::{Pod, Zeroable};
 use fontdue::{Font, FontSettings};
 
-/// Screen-space textured vertex for label glyphs.
+/// Screen-space textured vertex for label glyphs (and solid marker triangles,
+/// which sample a reserved fully-opaque texel).
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
 pub struct TextVertex {
     pub pos: [f32; 2], // screen pixels (origin top-left)
     pub uv: [f32; 2],
+    pub color: [f32; 3],
 }
 
 #[derive(Clone, Copy)]
@@ -105,7 +107,18 @@ impl FontAtlas {
                 },
             );
         }
+        // Reserve texel (0,0) as a fully-opaque pixel so marker triangles can
+        // sample it through the same pipeline. Glyph packing starts at (1,1),
+        // and row/col 0 are padding, so this texel is never touched by glyphs.
+        pixels[0] = 255;
+
         FontAtlas { width: atlas_w, height: atlas_h, pixels, px, glyphs }
+    }
+
+    /// UV of the reserved fully-opaque texel — used to draw solid shapes
+    /// (peak markers) with the text pipeline.
+    pub fn solid_uv(&self) -> [f32; 2] {
+        [0.5 / self.width as f32, 0.5 / self.height as f32]
     }
 
     /// Total advance width of `s` in pixels.
@@ -116,8 +129,8 @@ impl FontAtlas {
     }
 
     /// Lay `s` out with its left edge at `pen` and text baseline at `baseline`
-    /// (screen pixels), appending two triangles per visible glyph to `out`.
-    pub fn layout(&self, s: &str, mut pen: f32, baseline: f32, out: &mut Vec<TextVertex>) {
+    /// (screen pixels) in `color`, appending two triangles per visible glyph.
+    pub fn layout(&self, s: &str, mut pen: f32, baseline: f32, color: [f32; 3], out: &mut Vec<TextVertex>) {
         for c in s.chars() {
             let Some(g) = self.glyphs.get(&c) else {
                 pen += self.px * 0.5;
@@ -128,14 +141,23 @@ impl FontAtlas {
                 let top = baseline - g.ymin - g.h; // ymin is bottom edge above baseline (y up)
                 let (right, bottom) = (left + g.w, top + g.h);
                 let (u0, v0, u1, v1) = (g.uv0[0], g.uv0[1], g.uv1[0], g.uv1[1]);
-                out.push(TextVertex { pos: [left, top], uv: [u0, v0] });
-                out.push(TextVertex { pos: [left, bottom], uv: [u0, v1] });
-                out.push(TextVertex { pos: [right, top], uv: [u1, v0] });
-                out.push(TextVertex { pos: [right, top], uv: [u1, v0] });
-                out.push(TextVertex { pos: [left, bottom], uv: [u0, v1] });
-                out.push(TextVertex { pos: [right, bottom], uv: [u1, v1] });
+                out.push(TextVertex { pos: [left, top], uv: [u0, v0], color });
+                out.push(TextVertex { pos: [left, bottom], uv: [u0, v1], color });
+                out.push(TextVertex { pos: [right, top], uv: [u1, v0], color });
+                out.push(TextVertex { pos: [right, top], uv: [u1, v0], color });
+                out.push(TextVertex { pos: [left, bottom], uv: [u0, v1], color });
+                out.push(TextVertex { pos: [right, bottom], uv: [u1, v1], color });
             }
             pen += g.advance;
         }
+    }
+
+    /// Append a small upward-pointing solid triangle centred at (cx, cy), used
+    /// as a peak marker. Samples the reserved opaque texel.
+    pub fn marker(&self, cx: f32, cy: f32, size: f32, color: [f32; 3], out: &mut Vec<TextVertex>) {
+        let uv = self.solid_uv();
+        out.push(TextVertex { pos: [cx, cy - size], uv, color });
+        out.push(TextVertex { pos: [cx - size * 0.85, cy + size * 0.7], uv, color });
+        out.push(TextVertex { pos: [cx + size * 0.85, cy + size * 0.7], uv, color });
     }
 }

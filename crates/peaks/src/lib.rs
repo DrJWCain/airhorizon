@@ -49,6 +49,11 @@ pub struct Peaks {
 }
 
 impl Peaks {
+    /// An empty set (fallback when the CSV can't be loaded).
+    pub fn empty() -> Self {
+        Peaks { peaks: Vec::new(), rtree: RTree::new() }
+    }
+
     pub fn len(&self) -> usize {
         self.peaks.len()
     }

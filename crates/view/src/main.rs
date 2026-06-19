@@ -15,8 +15,9 @@ use text::{FontAtlas, TextVertex};
 
 use basemap::{GeomKind, Mbtiles};
 use bytemuck::{Pod, Zeroable};
-use geodesy::{LatLon, Tile, MERCATOR_MAX};
+use geodesy::{LatLon, Mercator, Tile, MERCATOR_MAX};
 use mapdata::{load_paths, PathKind};
+use peaks::Peaks;
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{BuffersBuilder, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers};
@@ -76,6 +77,10 @@ struct PathUniform {
 /// Roads stroke width in tile-local units. Footpaths match roads by computing
 /// the equivalent on-screen pixel width each frame from the current zoom/level.
 const ROAD_WIDTH_TILE: f32 = 22.0;
+
+/// Label text colours.
+const PLACE_LABEL_COLOR: [f32; 3] = [0.12, 0.10, 0.10]; // settlements/water: near-black
+const PEAK_LABEL_COLOR: [f32; 3] = [0.60, 0.22, 0.0]; // summits: burnt orange
 
 /// How a Zoomstack layer is drawn: a filled area, or a stroked line of a given
 /// width. Stroke width is in tile-local units (0..4096); since `slippy_zoom`
@@ -273,6 +278,32 @@ fn label_priority(kind: &str) -> u8 {
         "Water" => 3,
         "Hamlet" | "Small Settlements" => 4,
         _ => 3,
+    }
+}
+
+/// Lowest slippy zoom at which a peak of this prominence (m) is labelled.
+fn peak_min_zoom(prom: f64) -> u8 {
+    if prom >= 600.0 {
+        8
+    } else if prom >= 300.0 {
+        10
+    } else if prom >= 150.0 {
+        11
+    } else if prom >= 100.0 {
+        12
+    } else {
+        13
+    }
+}
+
+/// Peak label collision priority by prominence (lower = placed first).
+fn peak_priority(prom: f64) -> u8 {
+    if prom >= 300.0 {
+        1
+    } else if prom >= 150.0 {
+        2
+    } else {
+        3
     }
 }
 
@@ -546,6 +577,10 @@ struct AppState {
     text_ubuf: wgpu::Buffer,
     text_ubg: wgpu::BindGroup,
     text_tex_bg: wgpu::BindGroup,
+    /// DoBIH summits (K toggles markers+height, N toggles the peak name text).
+    peaks: Peaks,
+    show_peaks: bool,
+    show_peak_names: bool,
 }
 
 /// Build the text rendering resources: upload the atlas as an R8 texture and
@@ -667,6 +702,7 @@ fn build_text(
                 attributes: &[
                     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
                     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
+                    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 16, shader_location: 2 },
                 ],
             }],
         },
@@ -950,34 +986,93 @@ impl AppState {
         // Build screen-space label geometry for visible tiles (deduped by name).
         let mut label_buf: Option<wgpu::Buffer> = None;
         let mut label_count = 0u32;
-        if self.show_labels {
+        if self.show_labels || self.show_peaks {
             // Gather on-screen candidates passing the per-type zoom threshold.
-            struct Cand<'a> {
+            struct Cand {
                 pr: u8,
-                name: &'a str,
+                text: String,
+                color: [f32; 3],
+                marker: bool, // peak: draw a summit triangle and offset text up
                 sx: f64,
                 sy: f64,
                 w: f64,
             }
             let mut cands: Vec<Cand> = Vec::new();
-            for t in &want {
-                let Some(m) = self.tiles.get(t) else { continue };
-                for (name, kind, mp) in &m.labels {
-                    if z < label_min_zoom(kind) {
-                        continue;
+            let project = |mx: f64, my: f64| {
+                (
+                    (mx - self.cam.center_x) * self.cam.zoom + self.cam.vw * 0.5,
+                    self.cam.vh * 0.5 - (my - self.cam.center_y) * self.cam.zoom,
+                )
+            };
+            let on_screen = |sx: f64, sy: f64| {
+                sx > -100.0 && sx < self.cam.vw + 100.0 && sy > -20.0 && sy < self.cam.vh + 20.0
+            };
+            if self.show_labels {
+                for t in &want {
+                    let Some(m) = self.tiles.get(t) else { continue };
+                    for (name, kind, mp) in &m.labels {
+                        if z < label_min_zoom(kind) {
+                            continue;
+                        }
+                        let (sx, sy) = project(mp[0] as f64, mp[1] as f64);
+                        if !on_screen(sx, sy) {
+                            continue;
+                        }
+                        cands.push(Cand {
+                            pr: label_priority(kind),
+                            color: PLACE_LABEL_COLOR,
+                            marker: false,
+                            sx,
+                            sy,
+                            w: self.atlas.measure(name) as f64,
+                            text: name.clone(),
+                        });
                     }
-                    let sx = (mp[0] as f64 - self.cam.center_x) * self.cam.zoom + self.cam.vw * 0.5;
-                    let sy = self.cam.vh * 0.5 - (mp[1] as f64 - self.cam.center_y) * self.cam.zoom;
-                    if sx < -100.0 || sx > self.cam.vw + 100.0 || sy < -20.0 || sy > self.cam.vh + 20.0 {
-                        continue;
-                    }
-                    cands.push(Cand { pr: label_priority(kind), name, sx, sy, w: self.atlas.measure(name) as f64 });
                 }
             }
-            // Important first, then a stable key so the same labels win frame to
-            // frame (less flicker while panning).
+            if self.show_peaks {
+                // Peaks in the visible lon/lat box, filtered by prominence vs zoom.
+                let (ax, ay) = self.cam.screen_to_merc(0.0, 0.0);
+                let (bx, by) = self.cam.screen_to_merc(self.cam.vw, self.cam.vh);
+                let nw = Mercator::new(ax.min(bx), ay.max(by)).to_latlon();
+                let se = Mercator::new(ax.max(bx), ay.min(by)).to_latlon();
+                let (ox, oy) = (self.cam.origin_x, self.cam.origin_y);
+                for pk in self.peaks.in_bbox(nw.lon, se.lat, se.lon, nw.lat) {
+                    if z < peak_min_zoom(pk.prominence_m) {
+                        continue;
+                    }
+                    let m = LatLon::new(pk.lat, pk.lon).to_mercator();
+                    let (sx, sy) = project(m.x - ox, m.y - oy);
+                    if !on_screen(sx, sy) {
+                        continue;
+                    }
+                    // Always show the height; the name is toggleable (N).
+                    let h_m = pk.height_m.round() as i32;
+                    let text = if self.show_peak_names {
+                        format!("{} {}m", pk.name, h_m)
+                    } else {
+                        format!("{}m", h_m)
+                    };
+                    let w = self.atlas.measure(&text) as f64;
+                    cands.push(Cand {
+                        pr: peak_priority(pk.prominence_m),
+                        color: PEAK_LABEL_COLOR,
+                        marker: true,
+                        sx,
+                        sy,
+                        w,
+                        text,
+                    });
+                }
+            }
+            // Peaks first (so summits win collisions over place-names), then by
+            // priority, then a stable key so the same labels win frame to frame.
             cands.sort_by(|a, b| {
-                a.pr.cmp(&b.pr).then(a.name.cmp(b.name)).then(a.sx.partial_cmp(&b.sx).unwrap_or(std::cmp::Ordering::Equal))
+                b.marker
+                    .cmp(&a.marker) // marker=true (peaks) sort first
+                    .then(a.pr.cmp(&b.pr))
+                    .then(a.text.cmp(&b.text))
+                    .then(a.sx.partial_cmp(&b.sx).unwrap_or(std::cmp::Ordering::Equal))
             });
             // Greedy collision: place a label only if its box is clear. This also
             // collapses the duplicate label points Zoomstack repeats per tile.
@@ -985,12 +1080,21 @@ impl AppState {
             let mut boxes: Vec<[f64; 4]> = Vec::new();
             let mut tv: Vec<TextVertex> = Vec::new();
             for c in &cands {
-                let (l, t, r, b) = (c.sx - c.w * 0.5, c.sy - h * 0.5, c.sx + c.w * 0.5, c.sy + h * 0.5);
+                // Peaks put their text above the summit marker; place-names sit on
+                // the point. Collision box covers the text (and the marker below).
+                let baseline = if c.marker { c.sy - 9.0 } else { c.sy };
+                let box_cy = if c.marker { c.sy - 4.0 } else { c.sy };
+                let box_h = if c.marker { h + 12.0 } else { h };
+                let (l, t, r, b) =
+                    (c.sx - c.w * 0.5, box_cy - box_h * 0.5, c.sx + c.w * 0.5, box_cy + box_h * 0.5);
                 if boxes.iter().any(|x| l < x[2] && r > x[0] && t < x[3] && b > x[1]) {
                     continue;
                 }
                 boxes.push([l, t, r, b]);
-                self.atlas.layout(c.name, (c.sx - c.w * 0.5) as f32, c.sy as f32, &mut tv);
+                if c.marker {
+                    self.atlas.marker(c.sx as f32, c.sy as f32, 5.0, c.color, &mut tv);
+                }
+                self.atlas.layout(&c.text, (c.sx - c.w * 0.5) as f32, baseline as f32, c.color, &mut tv);
             }
             if !tv.is_empty() {
                 label_buf = Some(self.gpu.device.create_buffer_init(
@@ -1089,6 +1193,7 @@ impl AppState {
 struct App {
     path: std::path::PathBuf,
     paths_pbf: std::path::PathBuf,
+    peaks_csv: std::path::PathBuf,
     at: LatLon,
     state: Option<AppState>,
 }
@@ -1118,6 +1223,17 @@ impl ApplicationHandler for App {
         let (text_pipeline, text_ubuf, text_ubg, text_tex_bg) =
             build_text(&gpu.device, &gpu.queue, gpu.config.format, &atlas);
 
+        let peaks = match Peaks::load_csv(&self.peaks_csv) {
+            Ok(p) => {
+                println!("loaded {} peaks", p.len());
+                p
+            }
+            Err(e) => {
+                eprintln!("peaks: load failed ({e}); continuing without");
+                Peaks::empty()
+            }
+        };
+
         self.state = Some(AppState {
             window,
             gpu,
@@ -1142,6 +1258,9 @@ impl ApplicationHandler for App {
             text_ubuf,
             text_ubg,
             text_tex_bg,
+            peaks,
+            show_peaks: true,
+            show_peak_names: true,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -1186,6 +1305,22 @@ impl ApplicationHandler for App {
                 s.show_labels = !s.show_labels;
                 s.window.request_redraw();
                 println!("labels: {}", if s.show_labels { "on" } else { "off" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyK) =>
+            {
+                s.show_peaks = !s.show_peaks;
+                s.window.request_redraw();
+                println!("peaks: {}", if s.show_peaks { "on" } else { "off" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyN) =>
+            {
+                s.show_peak_names = !s.show_peak_names;
+                s.window.request_redraw();
+                println!("peak names: {}", if s.show_peak_names { "on" } else { "off" });
             }
             WindowEvent::Resized(new) => {
                 s.gpu.resize(new.width, new.height);
@@ -1275,6 +1410,7 @@ fn main() {
     let mut app = App {
         path: path.into(),
         paths_pbf: r"C:\maps\airhorizon\data\cumbria-latest.osm.pbf".into(),
+        peaks_csv: r"C:\maps\airhorizon\data\DoBIH_v18_4.csv".into(),
         at: LatLon::new(lat, lon),
         state: None,
     };

@@ -64,12 +64,21 @@ impl GeomKind {
     }
 }
 
-/// One feature: its geometry kind and parts. Each "part" is a ring (polygon),
-/// a polyline (line), or a run of points, in tile-local coordinates.
+/// One feature: geometry kind, parts, and resolved attributes. Each "part" is a
+/// ring (polygon), a polyline (line), or a run of points, in tile-local coords.
 #[derive(Debug, Clone)]
 pub struct Feature {
     pub kind: GeomKind,
     pub parts: Vec<Vec<[f32; 2]>>,
+    /// Decoded (key, value) attributes, e.g. ("name1", "Keswick").
+    pub attrs: Vec<(String, String)>,
+}
+
+impl Feature {
+    /// Attribute value for `key`, if present.
+    pub fn attr(&self, key: &str) -> Option<&str> {
+        self.attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
 }
 
 /// One layer's decoded features plus its attribute-key dictionary.
@@ -166,6 +175,7 @@ impl Mbtiles {
                 .map(|f| Feature {
                     kind: GeomKind::from_mvt(f.r#type.unwrap_or(0)),
                     parts: decode_geometry(&f.geometry),
+                    attrs: resolve_attrs(&f.tags, &l.keys, &l.values),
                 })
                 .collect();
             layers.push(Layer {
@@ -238,6 +248,44 @@ fn decode_geometry(geom: &[u32]) -> Vec<Vec<[f32; 2]>> {
 /// MVT zig-zag decode: maps an unsigned parameter back to a signed delta.
 fn zigzag(n: u32) -> i32 {
     ((n >> 1) as i32) ^ (-((n & 1) as i32))
+}
+
+/// Resolve a feature's `tags` (alternating key/value dictionary indices) into
+/// (key, value) strings using the layer's keys and values dictionaries.
+fn resolve_attrs(
+    tags: &[u32],
+    keys: &[String],
+    values: &[geozero::mvt::tile::Value],
+) -> Vec<(String, String)> {
+    let mut out = Vec::with_capacity(tags.len() / 2);
+    for pair in tags.chunks_exact(2) {
+        let (ki, vi) = (pair[0] as usize, pair[1] as usize);
+        if let (Some(key), Some(val)) = (keys.get(ki), values.get(vi)) {
+            out.push((key.clone(), value_to_string(val)));
+        }
+    }
+    out
+}
+
+/// Render an MVT value (exactly one field is set) as a string.
+fn value_to_string(v: &geozero::mvt::tile::Value) -> String {
+    if let Some(s) = &v.string_value {
+        s.clone()
+    } else if let Some(f) = v.float_value {
+        f.to_string()
+    } else if let Some(d) = v.double_value {
+        d.to_string()
+    } else if let Some(i) = v.int_value {
+        i.to_string()
+    } else if let Some(u) = v.uint_value {
+        u.to_string()
+    } else if let Some(i) = v.sint_value {
+        i.to_string()
+    } else if let Some(b) = v.bool_value {
+        b.to_string()
+    } else {
+        String::new()
+    }
 }
 
 /// Gzip-decompress if the blob carries the gzip magic (1f 8b); otherwise return

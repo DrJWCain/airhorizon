@@ -62,6 +62,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     max_c,
                     l.keys.join(", ")
                 );
+                // For the names layer, show a few resolved labels (verifies B5a).
+                if l.name == "names" {
+                    for f in l.features.iter().take(6) {
+                        if let Some(n) = f.attr("name1") {
+                            println!("      name1={:?} type={:?}", n, f.attr("type"));
+                        }
+                    }
+                }
             }
         }
     }

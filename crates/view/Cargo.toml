@@ -17,3 +17,4 @@ winit = "0.30"
 wgpu = "23"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
+earcutr = "0.4"   # polygon triangulation for area fills

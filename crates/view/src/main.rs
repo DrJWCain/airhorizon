@@ -40,18 +40,53 @@ struct ViewUniform {
     y_offset: f32,
 }
 
-/// Per-Zoomstack-layer line colour, or `None` to skip the layer. We draw line
-/// layers and polygon outlines (rings drawn as line segments) for an MVP.
-fn layer_color(name: &str) -> Option<[f32; 3]> {
+/// How a Zoomstack layer is drawn: a filled area or a stroked line.
+#[derive(Clone, Copy)]
+enum Style {
+    Fill([f32; 3]),
+    Stroke([f32; 3]),
+}
+
+/// Per-layer style, or `None` to skip. Fills are pale so the strokes read on top.
+fn style(name: &str) -> Option<Style> {
+    use Style::{Fill, Stroke};
     Some(match name {
-        "roads" => [0.30, 0.28, 0.26],
-        "waterlines" | "surfacewater" => [0.20, 0.50, 0.85],
-        "contours" => [0.74, 0.58, 0.42],
-        "woodland" | "greenspaces" => [0.40, 0.62, 0.40],
-        "buildings" => [0.52, 0.46, 0.46],
-        "national_parks" => [0.55, 0.40, 0.55],
+        // Area fills (polygons), drawn underneath.
+        "woodland" => Fill([0.80, 0.88, 0.73]),
+        "greenspaces" => Fill([0.86, 0.91, 0.80]),
+        "surfacewater" => Fill([0.69, 0.82, 0.92]),
+        "buildings" => Fill([0.84, 0.79, 0.76]),
+        // Line strokes, drawn on top.
+        "roads" => Stroke([0.28, 0.26, 0.24]),
+        "waterlines" => Stroke([0.20, 0.45, 0.80]),
+        "contours" => Stroke([0.78, 0.66, 0.50]),
+        "national_parks" => Stroke([0.55, 0.40, 0.55]),
         _ => return None, // names (points), sites, etc.
     })
+}
+
+/// Drop a ring's explicit closing vertex (our decoder repeats first==last).
+fn open_ring(ring: &[[f32; 2]]) -> &[[f32; 2]] {
+    if ring.len() >= 2 && ring.first() == ring.last() {
+        &ring[..ring.len() - 1]
+    } else {
+        ring
+    }
+}
+
+/// Shoelace signed area in tile coordinates (y-down). MVT exterior rings are
+/// clockwise => positive area; interior rings (holes) => negative.
+fn signed_area(r: &[[f32; 2]]) -> f32 {
+    let n = r.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut a = 0.0f32;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        a += r[i][0] * r[j][1] - r[j][0] * r[i][1];
+    }
+    a * 0.5
 }
 
 /// View state: a centre point and zoom in Web Mercator space, stored relative
@@ -134,11 +169,14 @@ impl Camera {
     }
 }
 
-/// GPU line mesh for one tile (`None` vertices => tile present but nothing to
-/// draw; we still cache it so it isn't re-decoded).
+/// GPU geometry for one tile: a triangle-list fill mesh and a line-list stroke
+/// mesh. Either may be empty; an all-empty mesh is still cached so the tile
+/// isn't re-decoded.
 struct TileMesh {
-    buffer: Option<wgpu::Buffer>,
-    count: u32,
+    fill_buf: Option<wgpu::Buffer>,
+    fill_count: u32,
+    line_buf: Option<wgpu::Buffer>,
+    line_count: u32,
 }
 
 struct Gpu {
@@ -146,7 +184,8 @@ struct Gpu {
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
+    fill_pipeline: wgpu::RenderPipeline,
     view_buf: wgpu::Buffer,
     view_bg: wgpu::BindGroup,
 }
@@ -235,51 +274,55 @@ impl Gpu {
             bind_group_layouts: &[&view_bgl],
             push_constant_ranges: &[],
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("line pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as u64,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x3,
-                            offset: 8,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::LineList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        // Both pipelines share the shader, layout and vertex format; only the
+        // primitive topology differs (lines vs filled triangles).
+        let make_pipeline = |topology: wgpu::PrimitiveTopology, label: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x3,
+                                offset: 8,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState { topology, ..Default::default() },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+        };
+        let fill_pipeline =
+            make_pipeline(wgpu::PrimitiveTopology::TriangleList, "fill pipeline");
+        let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList, "line pipeline");
 
-        Self { device, queue, surface, config, pipeline, view_buf, view_bg }
+        Self { device, queue, surface, config, line_pipeline, fill_pipeline, view_buf, view_bg }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -305,41 +348,96 @@ struct AppState {
 }
 
 impl AppState {
-    /// Tessellate one decoded tile's styled layers into Mercator-relative line
-    /// vertices (LineList: each segment is two vertices).
+    /// Tessellate one decoded tile's styled layers: polygons -> filled triangles
+    /// (earcut), lines/polygons -> stroked segments. All in Mercator-relative
+    /// f32 coordinates.
     fn build_mesh(&self, tile: Tile, vt: &basemap::VectorTile) -> TileMesh {
-        let mut verts: Vec<Vertex> = Vec::new();
+        let (ox, oy) = (self.cam.origin_x, self.cam.origin_y);
+        let to_vertex = |p: [f32; 2], color: [f32; 3]| {
+            let m = tile.mvt_to_mercator(p[0] as f64, p[1] as f64);
+            Vertex { pos: [(m.x - ox) as f32, (m.y - oy) as f32], color }
+        };
+
+        let mut fills: Vec<Vertex> = Vec::new();
+        let mut lines: Vec<Vertex> = Vec::new();
+
         for layer in &vt.layers {
-            let Some(color) = layer_color(&layer.name) else { continue };
-            for feat in &layer.features {
-                if feat.kind == GeomKind::Point {
-                    continue; // no point styling in the MVP
+            let Some(st) = style(&layer.name) else { continue };
+            match st {
+                Style::Stroke(color) => {
+                    for feat in &layer.features {
+                        if feat.kind == GeomKind::Point {
+                            continue;
+                        }
+                        for part in &feat.parts {
+                            for seg in part.windows(2) {
+                                lines.push(to_vertex(seg[0], color));
+                                lines.push(to_vertex(seg[1], color));
+                            }
+                        }
+                    }
                 }
-                for part in &feat.parts {
-                    for seg in part.windows(2) {
-                        for p in seg {
-                            let m = tile.mvt_to_mercator(p[0] as f64, p[1] as f64);
-                            verts.push(Vertex {
-                                pos: [
-                                    (m.x - self.cam.origin_x) as f32,
-                                    (m.y - self.cam.origin_y) as f32,
-                                ],
-                                color,
-                            });
+                Style::Fill(color) => {
+                    for feat in &layer.features {
+                        if feat.kind != GeomKind::Polygon {
+                            continue;
+                        }
+                        // Group rings into polygons: a positive-area (exterior)
+                        // ring starts a polygon; negative-area rings are its holes.
+                        let mut polys: Vec<Vec<&[[f32; 2]]>> = Vec::new();
+                        for ring in &feat.parts {
+                            let r = open_ring(ring);
+                            if r.len() < 3 {
+                                continue;
+                            }
+                            if signed_area(r) > 0.0 {
+                                polys.push(vec![r]);
+                            } else if let Some(last) = polys.last_mut() {
+                                last.push(r);
+                            } else {
+                                polys.push(vec![r]);
+                            }
+                        }
+                        for poly in &polys {
+                            let mut data: Vec<f32> = Vec::new();
+                            let mut holes: Vec<usize> = Vec::new();
+                            let mut flat: Vec<[f32; 2]> = Vec::new();
+                            for (ri, ring) in poly.iter().enumerate() {
+                                if ri > 0 {
+                                    holes.push(flat.len());
+                                }
+                                for &p in ring.iter() {
+                                    data.push(p[0]);
+                                    data.push(p[1]);
+                                    flat.push(p);
+                                }
+                            }
+                            if let Ok(idx) = earcutr::earcut(&data, &holes, 2) {
+                                for i in idx {
+                                    fills.push(to_vertex(flat[i], color));
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        if verts.is_empty() {
-            return TileMesh { buffer: None, count: 0 };
-        }
-        let buffer = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("tile lines"),
-            contents: bytemuck::cast_slice(&verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        TileMesh { buffer: Some(buffer), count: verts.len() as u32 }
+
+        let mk = |verts: &[Vertex], label| -> (Option<wgpu::Buffer>, u32) {
+            if verts.is_empty() {
+                (None, 0)
+            } else {
+                let buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some(label),
+                    contents: bytemuck::cast_slice(verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                (Some(buf), verts.len() as u32)
+            }
+        };
+        let (fill_buf, fill_count) = mk(&fills, "tile fills");
+        let (line_buf, line_count) = mk(&lines, "tile lines");
+        TileMesh { fill_buf, fill_count, line_buf, line_count }
     }
 
     fn render(&mut self) {
@@ -374,10 +472,10 @@ impl AppState {
             }
             let mesh = match self.mbt.decode_tile(t) {
                 Ok(Some(vt)) => self.build_mesh(t, &vt),
-                Ok(None) => TileMesh { buffer: None, count: 0 },
+                Ok(None) => TileMesh { fill_buf: None, fill_count: 0, line_buf: None, line_count: 0 },
                 Err(e) => {
                     eprintln!("decode {:?} failed: {e}", t);
-                    TileMesh { buffer: None, count: 0 }
+                    TileMesh { fill_buf: None, fill_count: 0, line_buf: None, line_count: 0 }
                 }
             };
             self.tiles.insert(t, mesh);
@@ -420,12 +518,21 @@ impl AppState {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            pass.set_pipeline(&self.gpu.pipeline);
             pass.set_bind_group(0, &self.gpu.view_bg, &[]);
+            // Fills underneath...
+            pass.set_pipeline(&self.gpu.fill_pipeline);
             for &t in &want {
-                if let Some(TileMesh { buffer: Some(buf), count }) = self.tiles.get(&t) {
+                if let Some(TileMesh { fill_buf: Some(buf), fill_count, .. }) = self.tiles.get(&t) {
                     pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.draw(0..*count, 0..1);
+                    pass.draw(0..*fill_count, 0..1);
+                }
+            }
+            // ...strokes on top.
+            pass.set_pipeline(&self.gpu.line_pipeline);
+            for &t in &want {
+                if let Some(TileMesh { line_buf: Some(buf), line_count, .. }) = self.tiles.get(&t) {
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..*line_count, 0..1);
                 }
             }
         }

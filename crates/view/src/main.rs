@@ -15,7 +15,9 @@ use text::{FontAtlas, TextVertex};
 
 use basemap::{GeomKind, Mbtiles};
 use bytemuck::{Pod, Zeroable};
+use dem::Dem;
 use geodesy::{LatLon, Mercator, Tile, MERCATOR_MAX};
+use horizon::{cast, visible_peaks, HorizonParams, Visibility};
 use mapdata::{load_paths, PathKind};
 use peaks::Peaks;
 use lyon::math::point;
@@ -80,7 +82,38 @@ const ROAD_WIDTH_TILE: f32 = 22.0;
 
 /// Label text colours.
 const PLACE_LABEL_COLOR: [f32; 3] = [0.12, 0.10, 0.10]; // settlements/water: near-black
-const PEAK_LABEL_COLOR: [f32; 3] = [0.60, 0.22, 0.0]; // summits: burnt orange
+const PEAK_LABEL_COLOR: [f32; 3] = [0.60, 0.22, 0.0]; // visible summits: burnt orange
+const SLOPE_LABEL_COLOR: [f32; 3] = [0.45, 0.72, 1.0]; // summit hidden, slopes in view: light blue (reads on green terrain)
+
+const DEM_DIR: &str = r"C:\maps\OS Terrain 50";
+
+/// What the viewer is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    Map,
+    Panorama,
+}
+
+/// A peak placed on the synthetic panorama.
+struct PanoPeak {
+    name: String,
+    bearing_deg: f64,
+    elev_deg: f64,
+    dist_km: f64,
+    /// Summit hidden behind a nearer ridge but the fell's slopes are in view.
+    obscured: bool,
+}
+
+/// State for the synthetic-panorama mode: the cast skyline + visible peaks from
+/// a fixed viewpoint, with the azimuth the view is currently centred on.
+struct PanoState {
+    viewpoint: LatLon,
+    ground_m: f64,
+    center_az: f64,
+    fov_deg: f64,
+    skyline: Vec<f32>, // horizon::AZIMUTH_BUCKETS elevation angles (radians)
+    peaks: Vec<PanoPeak>,
+}
 
 /// How a Zoomstack layer is drawn: a filled area, or a stroked line of a given
 /// width. Stroke width is in tile-local units (0..4096); since `slippy_zoom`
@@ -581,6 +614,10 @@ struct AppState {
     peaks: Peaks,
     show_peaks: bool,
     show_peak_names: bool,
+    /// Map vs synthetic panorama (V toggles). DEM loads lazily on first entry.
+    mode: Mode,
+    dem: Option<Dem>,
+    pano: Option<PanoState>,
 }
 
 /// Build the text rendering resources: upload the atlas as an R8 texture and
@@ -919,6 +956,210 @@ impl AppState {
         );
     }
 
+    /// Cast the horizon from the current map centre and switch to panorama mode.
+    /// DEM loads lazily on first use.
+    fn enter_panorama(&mut self) {
+        let m = Mercator::new(
+            self.cam.origin_x + self.cam.center_x,
+            self.cam.origin_y + self.cam.center_y,
+        )
+        .to_latlon();
+        let vp = LatLon::new(m.lat, m.lon);
+
+        if self.dem.is_none() {
+            println!("panorama: loading DEM (first use)...");
+            match Dem::open(std::path::Path::new(DEM_DIR)) {
+                Ok(d) => self.dem = Some(d),
+                Err(e) => {
+                    eprintln!("panorama: DEM load failed: {e}");
+                    return;
+                }
+            }
+        }
+        let dem = self.dem.as_ref().unwrap();
+        let params = HorizonParams::default();
+        let Some(h) = cast(dem, vp, &params) else {
+            eprintln!("panorama: ({:.4},{:.4}) is outside DEM coverage", vp.lat, vp.lon);
+            return;
+        };
+        // Distance-scaled prominence cut: keep low-prominence fells when they're
+        // near (e.g. Lingmell, a 72 m-drop shoulder, looms large from Wasdale),
+        // but require real prominence for distant ones to avoid clutter.
+        let mut peaks: Vec<PanoPeak> = visible_peaks(&h, vp, &self.peaks, &params)
+            .into_iter()
+            .filter(|v| v.peak.prominence_m >= 25.0 + 7.0 * (v.dist_m / 1000.0))
+            .map(|v| PanoPeak {
+                name: v.peak.name.clone(),
+                bearing_deg: v.bearing_deg,
+                elev_deg: v.elev_deg,
+                dist_km: v.dist_m / 1000.0,
+                obscured: v.visibility == Visibility::Slopes,
+            })
+            .collect();
+        // Visible summits first, then nearer peaks, win the name-collision pass.
+        peaks.sort_by(|a, b| {
+            a.obscured
+                .cmp(&b.obscured)
+                .then(a.dist_km.partial_cmp(&b.dist_km).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        let center_az = h.highest().0;
+        println!(
+            "panorama from ({:.4},{:.4}) ground {:.0} m: {} peaks visible",
+            vp.lat,
+            vp.lon,
+            h.eye_ground_m,
+            peaks.len()
+        );
+        self.pano = Some(PanoState {
+            viewpoint: vp,
+            ground_m: h.eye_ground_m,
+            center_az,
+            fov_deg: 90.0,
+            skyline: h.elev_rad,
+            peaks,
+        });
+        self.mode = Mode::Panorama;
+        self.window.request_redraw();
+    }
+
+    /// Render the synthetic panorama: sky, terrain fill under the skyline, the
+    /// skyline line, an eye-level reference, cardinal marks, and visible peaks
+    /// (marker + name). All drawn through the text pipeline via the solid texel.
+    fn render_panorama(&mut self) {
+        let Some(pano) = self.pano.as_ref() else { return };
+        let (vw, vh) = (self.cam.vw, self.cam.vh);
+        let (vwf, vhf) = (vw as f32, vh as f32);
+        let px_per_deg = vw / pano.fov_deg;
+        let eye_y = (vh * 0.5) as f32; // 0 deg elevation sits mid-screen
+        let suv = self.atlas.solid_uv();
+        let elev_to_y = |e_deg: f64| eye_y - (e_deg * px_per_deg) as f32;
+        let az_to_x = |az: f64| {
+            let d = (az - pano.center_az + 540.0).rem_euclid(360.0) - 180.0;
+            (vw * 0.5 + d * px_per_deg) as f32
+        };
+        let mut tv: Vec<TextVertex> = Vec::new();
+        let mut tri = |x0: f32, y0: f32, x1: f32, y1: f32, x2: f32, y2: f32, c: [f32; 3]| {
+            tv.push(TextVertex { pos: [x0, y0], uv: suv, color: c });
+            tv.push(TextVertex { pos: [x1, y1], uv: suv, color: c });
+            tv.push(TextVertex { pos: [x2, y2], uv: suv, color: c });
+        };
+
+        let terrain = [0.34, 0.37, 0.31];
+        let sky_line = [0.12, 0.13, 0.13];
+        let half = pano.fov_deg * 0.5 + 2.0;
+        let start = ((pano.center_az - half) * 10.0).floor() as i32;
+        let end = ((pano.center_az + half) * 10.0).ceil() as i32;
+        let buckets = horizon::AZIMUTH_BUCKETS as i32;
+        let mut prev: Option<(f32, f32)> = None;
+        for b in start..=end {
+            let bucket = b.rem_euclid(buckets) as usize;
+            let x = az_to_x(b as f64 * 0.1);
+            let y = elev_to_y((pano.skyline[bucket] as f64).to_degrees());
+            if let Some((px, py)) = prev {
+                // terrain quad from the skyline down to the bottom of the screen
+                tri(px, py, px, vhf, x, y, terrain);
+                tri(x, y, px, vhf, x, vhf, terrain);
+                // skyline line (vertical thickness)
+                let t = 1.5;
+                tri(px, py - t, px, py + t, x, y - t, sky_line);
+                tri(x, y - t, px, py + t, x, y + t, sky_line);
+            }
+            prev = Some((x, y));
+        }
+
+        // Eye-level (0 deg) reference line.
+        let y0 = elev_to_y(0.0);
+        tri(0.0, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 - 0.6, [0.5, 0.55, 0.6]);
+        tri(vwf, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 + 0.6, [0.5, 0.55, 0.6]);
+
+        // Cardinal marks along the bottom.
+        for (az, lbl) in [
+            (0.0, "N"), (45.0, "NE"), (90.0, "E"), (135.0, "SE"),
+            (180.0, "S"), (225.0, "SW"), (270.0, "W"), (315.0, "NW"),
+        ] {
+            let x = az_to_x(az);
+            if x < -20.0 || x > vwf + 20.0 {
+                continue;
+            }
+            let w = self.atlas.measure(lbl);
+            self.atlas.layout(lbl, x - w * 0.5, vhf - 8.0, [0.1, 0.1, 0.1], &mut tv);
+        }
+
+        // Visible peaks: marker at the summit point, name above (nearer wins).
+        let mut placed: Vec<(f32, f32)> = Vec::new();
+        for pk in &pano.peaks {
+            let x = az_to_x(pk.bearing_deg);
+            if x < 0.0 || x > vwf {
+                continue;
+            }
+            let y = elev_to_y(pk.elev_deg);
+            let color = if pk.obscured { SLOPE_LABEL_COLOR } else { PEAK_LABEL_COLOR };
+            self.atlas.marker(x, y, 4.0, color, &mut tv);
+            if self.show_peak_names {
+                let w = self.atlas.measure(&pk.name);
+                let hw = w * 0.5;
+                if placed.iter().any(|(qx, qhw)| (qx - x).abs() < qhw + hw) {
+                    continue;
+                }
+                placed.push((x, hw));
+                self.atlas.layout(&pk.name, x - hw, y - 8.0, color, &mut tv);
+            }
+        }
+
+        // HUD hint.
+        let hud = format!(
+            "PANORAMA  ({:.4}, {:.4})  ground {:.0} m   (V: map, drag: scrub, wheel: zoom, N: names)",
+            pano.viewpoint.lat, pano.viewpoint.lon, pano.ground_m
+        );
+        self.atlas.layout(&hud, 8.0, 22.0, [0.1, 0.1, 0.1], &mut tv);
+
+        // Upload + draw through the text pipeline; clear to a sky gradient base.
+        let tu = [vwf, vhf, 0.0, 0.0];
+        self.gpu.queue.write_buffer(&self.text_ubuf, 0, bytemuck::cast_slice(&tu));
+        let buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("panorama"),
+            contents: bytemuck::cast_slice(&tv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let frame = match self.gpu.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(_) => {
+                self.gpu.surface.configure(&self.gpu.device, &self.gpu.config);
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("pano enc") });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("pano pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.62, g: 0.74, b: 0.86, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if !tv.is_empty() {
+                pass.set_pipeline(&self.text_pipeline);
+                pass.set_bind_group(0, &self.text_ubg, &[]);
+                pass.set_bind_group(1, &self.text_tex_bg, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..tv.len() as u32, 0..1);
+            }
+        }
+        self.gpu.queue.submit(Some(enc.finish()));
+        frame.present();
+    }
+
     /// Draw the bottom-right key legend onto the text vertex list: a dark panel
     /// plus one line per toggle, white when on / grey when off.
     fn draw_legend(&self, tv: &mut Vec<TextVertex>) {
@@ -946,6 +1187,9 @@ impl AppState {
     }
 
     fn render(&mut self) {
+        if self.mode == Mode::Panorama {
+            return self.render_panorama();
+        }
         let z = self.cam.slippy_zoom(self.maxzoom);
         let ((tx0, ty0), (tx1, ty1)) = self.cam.visible_tiles(z);
 
@@ -1127,6 +1371,14 @@ impl AppState {
         // Always-on bottom-right key legend (drawn through the text pipeline).
         self.draw_legend(&mut tv);
 
+        // POV crosshair at screen centre — the viewpoint the panorama (V) casts from.
+        {
+            let (cx, cy) = (self.cam.vw as f32 * 0.5, self.cam.vh as f32 * 0.5);
+            let red = [0.85, 0.12, 0.12];
+            self.atlas.rect(cx - 9.0, cy - 1.5, cx + 9.0, cy + 1.5, red, &mut tv);
+            self.atlas.rect(cx - 1.5, cy - 9.0, cx + 1.5, cy + 9.0, red, &mut tv);
+        }
+
         if !tv.is_empty() {
             label_buf = Some(self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("labels+hud"),
@@ -1289,6 +1541,9 @@ impl ApplicationHandler for App {
             peaks,
             show_peaks: true,
             show_peak_names: true,
+            mode: Mode::Map,
+            dem: None,
+            pano: None,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -1301,7 +1556,25 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
             {
-                event_loop.exit();
+                // Esc leaves the panorama first, otherwise quits.
+                if s.mode == Mode::Panorama {
+                    s.mode = Mode::Map;
+                    s.window.request_redraw();
+                } else {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyV) =>
+            {
+                match s.mode {
+                    Mode::Map => s.enter_panorama(),
+                    Mode::Panorama => {
+                        s.mode = Mode::Map;
+                        s.window.request_redraw();
+                    }
+                }
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -1366,7 +1639,16 @@ impl ApplicationHandler for App {
                 s.cursor = Some(pos);
                 if s.dragging && s.touches.is_empty() {
                     if let Some((lx, ly)) = s.last_cursor {
-                        s.cam.pan_screen(pos.0 - lx, pos.1 - ly);
+                        match s.mode {
+                            Mode::Map => s.cam.pan_screen(pos.0 - lx, pos.1 - ly),
+                            Mode::Panorama => {
+                                if let Some(p) = s.pano.as_mut() {
+                                    // Drag right -> look left (azimuth decreases).
+                                    p.center_az =
+                                        (p.center_az - (pos.0 - lx) * p.fov_deg / s.cam.vw).rem_euclid(360.0);
+                                }
+                            }
+                        }
                         s.window.request_redraw();
                     }
                 }
@@ -1417,8 +1699,17 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::LineDelta(_, y) => y as f64,
                     MouseScrollDelta::PixelDelta(PhysicalPosition { y, .. }) => y / 120.0,
                 };
-                let (ax, ay) = s.cursor.unwrap_or((s.cam.vw * 0.5, s.cam.vh * 0.5));
-                s.cam.zoom_about(1.2f64.powf(scroll), ax, ay);
+                match s.mode {
+                    Mode::Map => {
+                        let (ax, ay) = s.cursor.unwrap_or((s.cam.vw * 0.5, s.cam.vh * 0.5));
+                        s.cam.zoom_about(1.2f64.powf(scroll), ax, ay);
+                    }
+                    Mode::Panorama => {
+                        if let Some(p) = s.pano.as_mut() {
+                            p.fov_deg = (p.fov_deg * 1.1f64.powf(-scroll)).clamp(20.0, 160.0);
+                        }
+                    }
+                }
                 s.window.request_redraw();
             }
             WindowEvent::RedrawRequested => s.render(),

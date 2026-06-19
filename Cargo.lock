@@ -2447,9 +2447,11 @@ version = "0.1.0"
 dependencies = [
  "basemap",
  "bytemuck",
+ "dem",
  "earcutr",
  "fontdue",
  "geodesy",
+ "horizon",
  "lyon",
  "mapdata",
  "peaks",

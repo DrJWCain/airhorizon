@@ -45,6 +45,9 @@ pub struct Horizon {
     /// due north, increasing clockwise. Buckets the ray never hit hold the
     /// "looking at nothing" floor of −π/2.
     pub elev_rad: Vec<f32>,
+    /// Horizontal distance (m) at which each bucket's skyline point sits — i.e.
+    /// how far away the ridge forming the horizon in that direction is.
+    pub dist_m: Vec<f32>,
     /// Ground elevation sampled at the viewpoint (m).
     pub eye_ground_m: f64,
 }
@@ -52,8 +55,16 @@ pub struct Horizon {
 impl Horizon {
     /// Apparent elevation (radians) for a compass bearing in degrees.
     pub fn at_bearing_deg(&self, deg: f64) -> f32 {
-        let i = (deg.rem_euclid(360.0) * 10.0).round() as usize % AZIMUTH_BUCKETS;
-        self.elev_rad[i]
+        self.elev_rad[Self::bucket(deg)]
+    }
+
+    /// Distance (m) of the skyline ridge at a compass bearing.
+    pub fn dist_at_bearing_deg(&self, deg: f64) -> f32 {
+        self.dist_m[Self::bucket(deg)]
+    }
+
+    fn bucket(deg: f64) -> usize {
+        (deg.rem_euclid(360.0) * 10.0).round() as usize % AZIMUTH_BUCKETS
     }
 
     /// The highest skyline point: (bearing °, elevation °).
@@ -77,10 +88,12 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
     let r_eff = EARTH_RADIUS_M / (1.0 - params.refraction_k);
 
     let mut elev = vec![(-PI / 2.0) as f32; AZIMUTH_BUCKETS];
-    for (i, slot) in elev.iter_mut().enumerate() {
+    let mut dist = vec![0.0f32; AZIMUTH_BUCKETS];
+    for i in 0..AZIMUTH_BUCKETS {
         let az = i as f64 * 0.1 * PI / 180.0;
         let (dx, dy) = (az.sin(), az.cos()); // BNG east, north
         let mut max_elev = -PI / 2.0;
+        let mut best_d = 0.0;
         let mut d = 50.0;
         while d <= params.max_range_m {
             let h_t = dem.elevation_bng(eye_e + dx * d, eye_n + dy * d);
@@ -89,19 +102,31 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
                 let elev_angle = ((h_t - h_eye - curve_drop) / d).atan();
                 if elev_angle > max_elev {
                     max_elev = elev_angle;
+                    best_d = d;
                 }
             }
             // Step coarsens with distance: fine near the eye (DEM is 50 m), up
             // to 600 m far out where the skyline subtends a tiny angle anyway.
             d += (d * 0.015).clamp(30.0, 600.0);
         }
-        *slot = max_elev as f32;
+        elev[i] = max_elev as f32;
+        dist[i] = best_d as f32;
     }
 
-    Some(Horizon { elev_rad: elev, eye_ground_m: ground })
+    Some(Horizon { elev_rad: elev, dist_m: dist, eye_ground_m: ground })
 }
 
-/// A summit that clears the skyline from the viewpoint.
+/// How much of a fell can be seen from the viewpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility {
+    /// The summit itself clears the skyline.
+    Summit,
+    /// The summit is hidden behind a nearer ridge, but that ridge sits close to
+    /// the peak (its own shoulder) — so the fell's slopes are in view.
+    Slopes,
+}
+
+/// A peak that is at least partly visible from the viewpoint.
 #[derive(Debug, Clone)]
 pub struct VisiblePeak<'a> {
     pub peak: &'a Peak,
@@ -111,6 +136,7 @@ pub struct VisiblePeak<'a> {
     pub elev_deg: f64,
     /// Horizontal distance (m).
     pub dist_m: f64,
+    pub visibility: Visibility,
 }
 
 /// Which DoBIH summits within range are visible above the cast skyline.
@@ -131,6 +157,11 @@ pub fn visible_peaks<'a>(
     let r_eff = EARTH_RADIUS_M / (1.0 - params.refraction_k);
     let tol = 0.1_f64.to_radians();
 
+    // An obscured summit still counts as "slopes visible" if the ridge blocking
+    // it sits at least this fraction of the way out to the peak (i.e. it's the
+    // fell's own near shoulder rather than a separate fell in front).
+    const SLOPE_FRACTION: f64 = 0.5;
+
     let mut out = Vec::new();
     for pk in peaks.within_range(viewpoint.lat, viewpoint.lon, params.max_range_m) {
         let (pe, pn) = geodesy::wgs84_to_bng(pk.lat, pk.lon);
@@ -143,14 +174,21 @@ pub fn visible_peaks<'a>(
         let curve_drop = dist * dist / (2.0 * r_eff);
         let elev = ((pk.height_m - h_eye - curve_drop) / dist).atan();
         let skyline = horizon.at_bearing_deg(bearing) as f64;
-        if elev + tol >= skyline {
-            out.push(VisiblePeak {
-                peak: pk,
-                bearing_deg: bearing,
-                elev_deg: elev.to_degrees(),
-                dist_m: dist,
-            });
-        }
+
+        let visibility = if elev + tol >= skyline {
+            Visibility::Summit
+        } else if horizon.dist_at_bearing_deg(bearing) as f64 >= dist * SLOPE_FRACTION {
+            Visibility::Slopes // summit hidden, but the obscuring ridge is near it
+        } else {
+            continue; // fully hidden behind a nearer fell
+        };
+        out.push(VisiblePeak {
+            peak: pk,
+            bearing_deg: bearing,
+            elev_deg: elev.to_degrees(),
+            dist_m: dist,
+            visibility,
+        });
     }
     out
 }

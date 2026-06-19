@@ -15,6 +15,8 @@ geodesy = { path = "../geodesy" }
 basemap = { path = "../basemap" }
 mapdata = { path = "../mapdata" }
 peaks = { path = "../peaks" }
+dem = { path = "../dem" }
+horizon = { path = "../horizon" }
 winit = "0.30"
 wgpu = "23"
 pollster = "0.4"

@@ -1,0 +1,12 @@
+[package]
+name = "peaks"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Database of British & Irish Hills (DoBIH): load the CSV and query summits by area / prominence. Shared by the map labels and the AirHorizon horizon engine."
+
+[dependencies]
+csv = "1"
+rstar = "0.12"
+thiserror = "1"

@@ -4,6 +4,7 @@ members = [
     "crates/geodesy",
     "crates/basemap",
     "crates/mapdata",
+    "crates/peaks",
     "crates/view",
 ]
 

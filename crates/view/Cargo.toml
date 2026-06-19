@@ -1,0 +1,19 @@
+[package]
+name = "view"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "AirHorizon vector map viewer: live-renders OS Open Zoomstack MVT tiles (winit + wgpu)."
+
+[[bin]]
+name = "airhorizon-view"
+path = "src/main.rs"
+
+[dependencies]
+geodesy = { path = "../geodesy" }
+basemap = { path = "../basemap" }
+winit = "0.30"
+wgpu = "23"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }

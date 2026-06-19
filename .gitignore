@@ -1,0 +1,10 @@
+# Rust build artifacts (a shared CARGO_TARGET_DIR is normally used, but ignore anyway)
+/target/
+**/*.rs.bk
+*.pdb
+
+# Downloaded data pack — multi-GB and reproducible from the scripts below, so
+# track the downloaders but never the payload.
+/data/*
+!/data/download.sh
+!/data/lidar-download.ps1

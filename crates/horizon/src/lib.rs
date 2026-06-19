@@ -16,6 +16,7 @@ use std::f64::consts::PI;
 
 use dem::Dem;
 use geodesy::LatLon;
+use peaks::{Peak, Peaks};
 
 /// 3600 buckets = 0.1° resolution over the full 360°.
 pub const AZIMUTH_BUCKETS: usize = 3600;
@@ -98,4 +99,58 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
     }
 
     Some(Horizon { elev_rad: elev, eye_ground_m: ground })
+}
+
+/// A summit that clears the skyline from the viewpoint.
+#[derive(Debug, Clone)]
+pub struct VisiblePeak<'a> {
+    pub peak: &'a Peak,
+    /// Compass bearing to the peak (degrees, 0 = north, clockwise).
+    pub bearing_deg: f64,
+    /// Apparent elevation angle of the summit (degrees; may be negative).
+    pub elev_deg: f64,
+    /// Horizontal distance (m).
+    pub dist_m: f64,
+}
+
+/// Which DoBIH summits within range are visible above the cast skyline.
+///
+/// A peak is visible when its own apparent elevation (using its DoBIH summit
+/// height) reaches the horizon at its bearing — i.e. it isn't hidden behind a
+/// nearer, higher ridge. A small tolerance absorbs DEM-vs-DoBIH height
+/// differences and the 0.1° bearing quantisation. Must use the same eye height
+/// and refraction as the `horizon` was cast with.
+pub fn visible_peaks<'a>(
+    horizon: &Horizon,
+    viewpoint: LatLon,
+    peaks: &'a Peaks,
+    params: &HorizonParams,
+) -> Vec<VisiblePeak<'a>> {
+    let (eye_e, eye_n) = geodesy::wgs84_to_bng(viewpoint.lat, viewpoint.lon);
+    let h_eye = horizon.eye_ground_m + params.eye_height_m;
+    let r_eff = EARTH_RADIUS_M / (1.0 - params.refraction_k);
+    let tol = 0.1_f64.to_radians();
+
+    let mut out = Vec::new();
+    for pk in peaks.within_range(viewpoint.lat, viewpoint.lon, params.max_range_m) {
+        let (pe, pn) = geodesy::wgs84_to_bng(pk.lat, pk.lon);
+        let (de, dn) = (pe - eye_e, pn - eye_n);
+        let dist = (de * de + dn * dn).sqrt();
+        if dist < 30.0 {
+            continue; // the viewpoint's own summit
+        }
+        let bearing = de.atan2(dn).to_degrees().rem_euclid(360.0);
+        let curve_drop = dist * dist / (2.0 * r_eff);
+        let elev = ((pk.height_m - h_eye - curve_drop) / dist).atan();
+        let skyline = horizon.at_bearing_deg(bearing) as f64;
+        if elev + tol >= skyline {
+            out.push(VisiblePeak {
+                peak: pk,
+                bearing_deg: bearing,
+                elev_deg: elev.to_degrees(),
+                dist_m: dist,
+            });
+        }
+    }
+    out
 }

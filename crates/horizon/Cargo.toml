@@ -9,3 +9,4 @@ description = "Geometric horizon ray-caster: sweep a DEM to produce the apparent
 [dependencies]
 geodesy = { path = "../geodesy" }
 dem = { path = "../dem" }
+peaks = { path = "../peaks" }

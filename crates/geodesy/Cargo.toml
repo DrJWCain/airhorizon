@@ -1,0 +1,11 @@
+[package]
+name = "geodesy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Coordinate transforms for AirHorizon: WGS84, Web Mercator (slippy tiles), OSGB36 British National Grid."
+
+# B1a has no dependencies (pure math + std). The OSTN15 grid reader (B1b) will
+# add `tiff` for the NTv2 GeoTIFF grid; the public API stays the same.
+[dependencies]

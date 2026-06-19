@@ -45,6 +45,34 @@ struct ViewUniform {
     y_offset: f32,
 }
 
+/// Footpath vertex for screen-space line expansion (see path.wgsl).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct PathVertex {
+    pos: [f32; 2],   // segment endpoint, Mercator-relative
+    dir: [f32; 2],   // segment direction (world)
+    side: f32,       // +1 / -1
+    color: [f32; 3],
+}
+
+/// Uniform for the path pipeline: view transform + viewport + pixel half-width.
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct PathUniform {
+    x_scale: f32,
+    x_offset: f32,
+    y_scale: f32,
+    y_offset: f32,
+    vw: f32,
+    vh: f32,
+    half_px: f32,
+    _pad: f32,
+}
+
+/// Roads stroke width in tile-local units. Footpaths match roads by computing
+/// the equivalent on-screen pixel width each frame from the current zoom/level.
+const ROAD_WIDTH_TILE: f32 = 22.0;
+
 /// How a Zoomstack layer is drawn: a filled area, or a stroked line of a given
 /// width. Stroke width is in tile-local units (0..4096); since `slippy_zoom`
 /// keeps a tile ~512 px on screen, `width_px ~= width / 8`.
@@ -64,7 +92,7 @@ fn style(name: &str) -> Option<Style> {
         "surfacewater" => Fill([0.69, 0.82, 0.92]),
         "buildings" => Fill([0.84, 0.79, 0.76]),
         // Line strokes, drawn on top (width in tile units; ~/8 = screen px).
-        "roads" => Stroke([0.28, 0.26, 0.24], 22.0),
+        "roads" => Stroke([0.28, 0.26, 0.24], ROAD_WIDTH_TILE),
         "waterlines" => Stroke([0.20, 0.45, 0.80], 13.0),
         "contours" => Stroke([0.78, 0.66, 0.50], 6.0),
         // NB: don't stroke tile-clipped AREA polygons (e.g. national_parks) — the
@@ -225,6 +253,9 @@ struct Gpu {
     pipeline: wgpu::RenderPipeline,
     view_buf: wgpu::Buffer,
     view_bg: wgpu::BindGroup,
+    path_pipeline: wgpu::RenderPipeline,
+    path_ubuf: wgpu::Buffer,
+    path_bg: wgpu::BindGroup,
 }
 
 impl Gpu {
@@ -357,7 +388,91 @@ impl Gpu {
             cache: None,
         });
 
-        Self { device, queue, surface, config, pipeline, view_buf, view_bg }
+        // Path pipeline: its own uniform (adds viewport + half-width) and shader
+        // that expands segments to a constant pixel width.
+        let path_ubuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("path uniform"),
+            size: std::mem::size_of::<PathUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let path_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("path bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let path_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("path bg"),
+            layout: &path_bgl,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: path_ubuf.as_entire_binding() }],
+        });
+        let path_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("path shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("path.wgsl"))),
+        });
+        let path_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("path pl layout"),
+            bind_group_layouts: &[&path_bgl],
+            push_constant_ranges: &[],
+        });
+        let path_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("path pipeline"),
+            layout: Some(&path_layout),
+            vertex: wgpu::VertexState {
+                module: &path_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<PathVertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 16, shader_location: 2 },
+                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 20, shader_location: 3 },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &path_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        Self {
+            device,
+            queue,
+            surface,
+            config,
+            pipeline,
+            view_buf,
+            view_bg,
+            path_pipeline,
+            path_ubuf,
+            path_bg,
+        }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -505,9 +620,8 @@ impl AppState {
     }
 
     /// Load the OSM footpath overlay once: extract paths, project to
-    /// Mercator-relative, tessellate to thick strokes coloured by kind, upload
-    /// one buffer. Width is fixed in Mercator metres (sized for the current
-    /// zoom), so paths scale with zoom for now — fine for a first cut.
+    /// Mercator-relative, and emit one screen-space-expansion quad per segment
+    /// (constant pixel width at any zoom — the shader does the widening).
     fn ensure_paths_loaded(&mut self) {
         if self.paths_loaded {
             return;
@@ -522,10 +636,7 @@ impl AppState {
             }
         };
         let (ox, oy) = (self.cam.origin_x, self.cam.origin_y);
-        // ~1 px wide at the zoom paths are loaded at (they scale with zoom).
-        let width = (1.0 / self.cam.zoom).max(0.4) as f32;
-        let mut tess = StrokeTessellator::new();
-        let mut verts: Vec<Vertex> = Vec::new();
+        let mut verts: Vec<PathVertex> = Vec::new();
         for w in &ways {
             let color = match w.kind {
                 PathKind::Foot => [0.10, 0.45, 0.18],
@@ -540,8 +651,17 @@ impl AppState {
                     [(m.x - ox) as f32, (m.y - oy) as f32]
                 })
                 .collect();
-            for p in stroke_to_tris(&mut tess, &merc, width) {
-                verts.push(Vertex { pos: p, color });
+            for s in merc.windows(2) {
+                let (p0, p1) = (s[0], s[1]);
+                let dir = [p1[0] - p0[0], p1[1] - p0[1]];
+                let v = |pos, side| PathVertex { pos, dir, side, color };
+                // two triangles forming the segment quad
+                verts.push(v(p0, 1.0));
+                verts.push(v(p0, -1.0));
+                verts.push(v(p1, 1.0));
+                verts.push(v(p1, 1.0));
+                verts.push(v(p0, -1.0));
+                verts.push(v(p1, -1.0));
             }
         }
         if !verts.is_empty() {
@@ -604,9 +724,27 @@ impl AppState {
             loaded += 1;
         }
 
-        self.gpu
-            .queue
-            .write_buffer(&self.gpu.view_buf, 0, bytemuck::bytes_of(&self.cam.uniform()));
+        let vu = self.cam.uniform();
+        self.gpu.queue.write_buffer(&self.gpu.view_buf, 0, bytemuck::bytes_of(&vu));
+        if self.show_paths {
+            // Match the roads' current on-screen width: a tile of 4096 units
+            // spans `tile_span * zoom` px, so a road of ROAD_WIDTH_TILE units is
+            // this many px wide right now.
+            let tile_span = 2.0 * MERCATOR_MAX / ((1u32 << z) as f64);
+            let road_px = ROAD_WIDTH_TILE as f64 * tile_span * self.cam.zoom
+                / geodesy::TILE_EXTENT as f64;
+            let pu = PathUniform {
+                x_scale: vu.x_scale,
+                x_offset: vu.x_offset,
+                y_scale: vu.y_scale,
+                y_offset: vu.y_offset,
+                vw: self.cam.vw as f32,
+                vh: self.cam.vh as f32,
+                half_px: (road_px * 0.5) as f32,
+                _pad: 0.0,
+            };
+            self.gpu.queue.write_buffer(&self.gpu.path_ubuf, 0, bytemuck::bytes_of(&pu));
+        }
 
         let frame = match self.gpu.surface.get_current_texture() {
             Ok(f) => f,
@@ -656,10 +794,13 @@ impl AppState {
                     pass.draw(0..*stroke_count, 0..1);
                 }
             }
-            // OSM footpaths overlay, above everything.
+            // OSM footpaths overlay, above everything, via the screen-space
+            // expansion pipeline (constant pixel width at any zoom).
             if self.show_paths {
                 if let Some(buf) = &self.path_buf {
                     if self.path_count > 0 {
+                        pass.set_pipeline(&self.gpu.path_pipeline);
+                        pass.set_bind_group(0, &self.gpu.path_bg, &[]);
                         pass.set_vertex_buffer(0, buf.slice(..));
                         pass.draw(0..self.path_count, 0..1);
                     }

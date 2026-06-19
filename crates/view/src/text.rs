@@ -152,6 +152,18 @@ impl FontAtlas {
         }
     }
 
+    /// Append a solid filled rectangle (two triangles), used for the HUD panel.
+    pub fn rect(&self, x0: f32, y0: f32, x1: f32, y1: f32, color: [f32; 3], out: &mut Vec<TextVertex>) {
+        let uv = self.solid_uv();
+        let v = |x, y| TextVertex { pos: [x, y], uv, color };
+        out.push(v(x0, y0));
+        out.push(v(x0, y1));
+        out.push(v(x1, y0));
+        out.push(v(x1, y0));
+        out.push(v(x0, y1));
+        out.push(v(x1, y1));
+    }
+
     /// Append a small upward-pointing solid triangle centred at (cx, cy), used
     /// as a peak marker. Samples the reserved opaque texel.
     pub fn marker(&self, cx: f32, cy: f32, size: f32, color: [f32; 3], out: &mut Vec<TextVertex>) {

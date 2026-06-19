@@ -919,6 +919,32 @@ impl AppState {
         );
     }
 
+    /// Draw the bottom-right key legend onto the text vertex list: a dark panel
+    /// plus one line per toggle, white when on / grey when off.
+    fn draw_legend(&self, tv: &mut Vec<TextVertex>) {
+        let lines: [(&str, bool); 5] = [
+            ("R  roads", self.show_roads),
+            ("P  paths", self.show_paths),
+            ("L  labels", self.show_labels),
+            ("K  peaks", self.show_peaks),
+            ("N  peak names", self.show_peak_names),
+        ];
+        let (line_h, pad, margin) = (18.0f32, 7.0f32, 8.0f32);
+        let text_w = lines.iter().map(|(t, _)| self.atlas.measure(t)).fold(0.0f32, f32::max);
+        let panel_w = text_w + pad * 2.0;
+        let panel_h = line_h * lines.len() as f32 + pad * 2.0;
+        // Bottom-right corner.
+        let x1 = self.cam.vw as f32 - margin;
+        let y1 = self.cam.vh as f32 - margin;
+        let (x0, y0) = (x1 - panel_w, y1 - panel_h);
+        self.atlas.rect(x0, y0, x1, y1, [0.08, 0.08, 0.10], tv);
+        for (i, (t, on)) in lines.iter().enumerate() {
+            let baseline = y0 + pad + line_h * i as f32 + 13.0;
+            let color = if *on { [0.95, 0.95, 0.95] } else { [0.45, 0.45, 0.45] };
+            self.atlas.layout(t, x0 + pad, baseline, color, tv);
+        }
+    }
+
     fn render(&mut self) {
         let z = self.cam.slippy_zoom(self.maxzoom);
         let ((tx0, ty0), (tx1, ty1)) = self.cam.visible_tiles(z);
@@ -986,6 +1012,7 @@ impl AppState {
         // Build screen-space label geometry for visible tiles (deduped by name).
         let mut label_buf: Option<wgpu::Buffer> = None;
         let mut label_count = 0u32;
+        let mut tv: Vec<TextVertex> = Vec::new();
         if self.show_labels || self.show_peaks {
             // Gather on-screen candidates passing the per-type zoom threshold.
             struct Cand {
@@ -1078,7 +1105,6 @@ impl AppState {
             // collapses the duplicate label points Zoomstack repeats per tile.
             let h = self.atlas.px as f64;
             let mut boxes: Vec<[f64; 4]> = Vec::new();
-            let mut tv: Vec<TextVertex> = Vec::new();
             for c in &cands {
                 // Peaks put their text above the summit marker; place-names sit on
                 // the point. Collision box covers the text (and the marker below).
@@ -1096,18 +1122,20 @@ impl AppState {
                 }
                 self.atlas.layout(&c.text, (c.sx - c.w * 0.5) as f32, baseline as f32, c.color, &mut tv);
             }
-            if !tv.is_empty() {
-                label_buf = Some(self.gpu.device.create_buffer_init(
-                    &wgpu::util::BufferInitDescriptor {
-                        label: Some("labels"),
-                        contents: bytemuck::cast_slice(&tv),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    },
-                ));
-                label_count = tv.len() as u32;
-                let tu = [self.cam.vw as f32, self.cam.vh as f32, 0.0, 0.0];
-                self.gpu.queue.write_buffer(&self.text_ubuf, 0, bytemuck::cast_slice(&tu));
-            }
+        }
+
+        // Always-on bottom-right key legend (drawn through the text pipeline).
+        self.draw_legend(&mut tv);
+
+        if !tv.is_empty() {
+            label_buf = Some(self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("labels+hud"),
+                contents: bytemuck::cast_slice(&tv),
+                usage: wgpu::BufferUsages::VERTEX,
+            }));
+            label_count = tv.len() as u32;
+            let tu = [self.cam.vw as f32, self.cam.vh as f32, 0.0, 0.0];
+            self.gpu.queue.write_buffer(&self.text_ubuf, 0, bytemuck::cast_slice(&tu));
         }
 
         let frame = match self.gpu.surface.get_current_texture() {

@@ -113,6 +113,7 @@ struct PanoState {
     fov_deg: f64,
     skyline: Vec<f32>, // horizon::AZIMUTH_BUCKETS elevation angles (radians)
     edge_lines: Vec<Vec<(f32, f32)>>, // linked occlusion edges: (azimuth_deg, elev_rad)
+    edge_top: Vec<f32>, // per bucket: highest occlusion-edge elev (rad), or -inf
     peaks: Vec<PanoPeak>,
 }
 
@@ -620,6 +621,14 @@ struct AppState {
     dem: Option<Dem>,
     pano: Option<PanoState>,
     show_edges: bool,
+    /// Panorama render style: false = clean/natural, true = pen-and-ink artist view.
+    artist: bool,
+}
+
+/// Cheap deterministic 0..1 jitter from an integer, for hand-drawn variation.
+fn jitter(i: u32) -> f32 {
+    let x = i.wrapping_mul(2_654_435_761);
+    ((x >> 8) & 0xffff) as f32 / 65_535.0
 }
 
 /// Build the text rendering resources: upload the atlas as an R8 texture and
@@ -1017,6 +1026,11 @@ impl AppState {
             ground_m: h.eye_ground_m,
             center_az,
             fov_deg: 90.0,
+            edge_top: h
+                .edges
+                .iter()
+                .map(|v| v.iter().map(|&(e, _)| e).fold(f32::NEG_INFINITY, f32::max))
+                .collect(),
             edge_lines: h.edge_polylines(),
             skyline: h.elev_rad,
             peaks,
@@ -1035,6 +1049,21 @@ impl AppState {
         let px_per_deg = vw / pano.fov_deg;
         let eye_y = (vh * 0.5) as f32; // 0 deg elevation sits mid-screen
         let suv = self.atlas.solid_uv();
+
+        // Palette: natural (map-like) vs artist (pen-and-ink on paper).
+        let artist = self.artist;
+        let pal_sky = if artist {
+            wgpu::Color { r: 0.93, g: 0.89, b: 0.80, a: 1.0 } // paper
+        } else {
+            wgpu::Color { r: 0.62, g: 0.74, b: 0.86, a: 1.0 } // sky blue
+        };
+        let pal_terrain = if artist { [0.86, 0.81, 0.71] } else { [0.34, 0.37, 0.31] };
+        let pal_skyline = if artist { [0.16, 0.11, 0.05] } else { [0.12, 0.13, 0.13] };
+        let pal_edge = if artist { [0.30, 0.22, 0.12] } else { [0.18, 0.18, 0.20] };
+        let pal_eye = if artist { [0.62, 0.52, 0.36] } else { [0.5, 0.55, 0.6] };
+        let pal_text = if artist { [0.20, 0.13, 0.06] } else { [0.1, 0.1, 0.1] };
+        let pal_peak = if artist { [0.45, 0.20, 0.04] } else { PEAK_LABEL_COLOR };
+        let pal_slope = if artist { [0.40, 0.30, 0.18] } else { SLOPE_LABEL_COLOR };
         let elev_to_y = |e_deg: f64| eye_y - (e_deg * px_per_deg) as f32;
         let az_to_x = |az: f64| {
             let d = (az - pano.center_az + 540.0).rem_euclid(360.0) - 180.0;
@@ -1047,8 +1076,8 @@ impl AppState {
             tv.push(TextVertex { pos: [x2, y2], uv: suv, color: c });
         };
 
-        let terrain = [0.34, 0.37, 0.31];
-        let sky_line = [0.12, 0.13, 0.13];
+        let terrain = pal_terrain;
+        let sky_line = pal_skyline;
         let half = pano.fov_deg * 0.5 + 2.0;
         let start = ((pano.center_az - half) * 10.0).floor() as i32;
         let end = ((pano.center_az + half) * 10.0).ceil() as i32;
@@ -1072,13 +1101,44 @@ impl AppState {
 
         // Eye-level (0 deg) reference line.
         let y0 = elev_to_y(0.0);
-        tri(0.0, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 - 0.6, [0.5, 0.55, 0.6]);
-        tri(vwf, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 + 0.6, [0.5, 0.55, 0.6]);
+        tri(0.0, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 - 0.6, pal_eye);
+        tri(vwf, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 + 0.6, pal_eye);
+
+        // Artist view: hatch a fringe of short, length-varied ink strokes hanging
+        // from the skyline — the shaded near-slope, hand-drawn feel.
+        if artist {
+            let hatch_c = [0.42, 0.34, 0.22];
+            let mut b = start;
+            while b <= end {
+                let x = az_to_x(b as f64 * 0.1);
+                if x >= -2.0 && x <= vwf + 2.0 {
+                    let bucket = b.rem_euclid(buckets) as usize;
+                    let sy = elev_to_y((pano.skyline[bucket] as f64).to_degrees());
+                    let mut len = 5.0 + jitter(b as u32) * 10.0;
+                    // If a ridge line sits close below the skyline here, pull the
+                    // hatch up to stop above it so the line stays clean.
+                    let te = pano.edge_top[bucket];
+                    if te.is_finite() {
+                        let edge_y = elev_to_y((te as f64).to_degrees());
+                        let allowed = (edge_y - 3.0) - (sy + 1.0);
+                        if allowed < len {
+                            len = allowed;
+                        }
+                    }
+                    if len > 1.0 {
+                        let xw = 0.5;
+                        tri(x - xw, sy + 1.0, x - xw, sy + 1.0 + len, x + xw, sy + 1.0, hatch_c);
+                        tri(x + xw, sy + 1.0, x - xw, sy + 1.0 + len, x + xw, sy + 1.0 + len, hatch_c);
+                    }
+                }
+                b += 4; // ~every 0.4 deg
+            }
+        }
 
         // Wainwright-style occlusion edges, linked into lines: where a near ridge
         // ends and a farther fell shows behind it, traced across azimuths.
         if self.show_edges {
-            let edge_c = [0.18, 0.18, 0.20];
+            let edge_c = pal_edge;
             for line in &pano.edge_lines {
                 for w in line.windows(2) {
                     let x0 = az_to_x(w[0].0 as f64);
@@ -1108,7 +1168,7 @@ impl AppState {
                 continue;
             }
             let w = self.atlas.measure(lbl);
-            self.atlas.layout(lbl, x - w * 0.5, vhf - 8.0, [0.1, 0.1, 0.1], &mut tv);
+            self.atlas.layout(lbl, x - w * 0.5, vhf - 8.0, pal_text, &mut tv);
         }
 
         // Visible peaks: marker at the summit point, name above (nearer wins).
@@ -1119,7 +1179,7 @@ impl AppState {
                 continue;
             }
             let y = elev_to_y(pk.elev_deg);
-            let color = if pk.obscured { SLOPE_LABEL_COLOR } else { PEAK_LABEL_COLOR };
+            let color = if pk.obscured { pal_slope } else { pal_peak };
             self.atlas.marker(x, y, 4.0, color, &mut tv);
             if self.show_peak_names {
                 let w = self.atlas.measure(&pk.name);
@@ -1134,10 +1194,13 @@ impl AppState {
 
         // HUD hint.
         let hud = format!(
-            "PANORAMA  ({:.4}, {:.4})  ground {:.0} m   (V: map, drag: scrub, wheel: zoom, N: names, E: edges)",
-            pano.viewpoint.lat, pano.viewpoint.lon, pano.ground_m
+            "PANORAMA {} ({:.4}, {:.4})  ground {:.0} m   (V:map  drag:scrub  wheel:zoom  N:names  E:edges  A:style)",
+            if artist { "[artist]" } else { "[natural]" },
+            pano.viewpoint.lat,
+            pano.viewpoint.lon,
+            pano.ground_m
         );
-        self.atlas.layout(&hud, 8.0, 22.0, [0.1, 0.1, 0.1], &mut tv);
+        self.atlas.layout(&hud, 8.0, 22.0, pal_text, &mut tv);
         self.draw_mode_button(&mut tv);
 
         // Upload + draw through the text pipeline; clear to a sky gradient base.
@@ -1167,7 +1230,7 @@ impl AppState {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.62, g: 0.74, b: 0.86, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(pal_sky),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1607,6 +1670,7 @@ impl ApplicationHandler for App {
             dem: None,
             pano: None,
             show_edges: true,
+            artist: false,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -1646,6 +1710,14 @@ impl ApplicationHandler for App {
                 s.show_edges = !s.show_edges;
                 s.window.request_redraw();
                 println!("ridge edges: {}", if s.show_edges { "on" } else { "off" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyA) =>
+            {
+                s.artist = !s.artist;
+                s.window.request_redraw();
+                println!("panorama style: {}", if s.artist { "artist" } else { "natural" });
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed

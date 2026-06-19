@@ -20,3 +20,4 @@ pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
 earcutr = "0.4"   # polygon triangulation for area fills
 lyon = "1"        # stroke tessellation for thick lines
+fontdue = "0.9"   # glyph rasterisation for place-name labels

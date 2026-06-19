@@ -2,12 +2,16 @@
 //!
 //! Live-renders OS Open Zoomstack MVT tiles in Web Mercator: polygon area fills
 //! (earcut) under tessellated thick line strokes (lyon). Mouse drag / wheel and
-//! touch pan + pinch-zoom. Labels are still to come (B5).
+//! touch pan + pinch-zoom, OSM footpaths (P), and place-name labels (L).
 //!
 //!   cargo run -p view --release --offline -- [mbtiles] [lat] [lon]
 
+mod text;
+
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use text::{FontAtlas, TextVertex};
 
 use basemap::{GeomKind, Mbtiles};
 use bytemuck::{Pod, Zeroable};
@@ -243,6 +247,33 @@ struct TileMesh {
     area_count: u32,
     stroke_buf: Option<wgpu::Buffer>,
     stroke_count: u32,
+    /// Place-name labels: (name1, type, Mercator-relative point).
+    labels: Vec<(String, String, [f32; 2])>,
+}
+
+/// Lowest slippy zoom at which a label of this Zoomstack `type` is shown — keeps
+/// minor names off the map until you zoom in.
+fn label_min_zoom(kind: &str) -> u8 {
+    match kind {
+        "City" => 7,
+        "Town" => 9,
+        "Village" | "Suburban Area" => 11,
+        "Hamlet" | "Small Settlements" => 13,
+        "Water" => 13,
+        _ => 12,
+    }
+}
+
+/// Placement priority (lower = more important, placed first under collision).
+fn label_priority(kind: &str) -> u8 {
+    match kind {
+        "City" => 0,
+        "Town" => 1,
+        "Village" | "Suburban Area" => 2,
+        "Water" => 3,
+        "Hamlet" | "Small Settlements" => 4,
+        _ => 3,
+    }
 }
 
 struct Gpu {
@@ -508,6 +539,158 @@ struct AppState {
     show_paths: bool,
     path_buf: Option<wgpu::Buffer>,
     path_count: u32,
+    /// Place-name labels (L toggles).
+    atlas: FontAtlas,
+    show_labels: bool,
+    text_pipeline: wgpu::RenderPipeline,
+    text_ubuf: wgpu::Buffer,
+    text_ubg: wgpu::BindGroup,
+    text_tex_bg: wgpu::BindGroup,
+}
+
+/// Build the text rendering resources: upload the atlas as an R8 texture and
+/// make the pipeline (screen-px quads sampling coverage as alpha). Returns
+/// (pipeline, viewport-uniform buffer, uniform bind group, texture bind group).
+fn build_text(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+    atlas: &FontAtlas,
+) -> (wgpu::RenderPipeline, wgpu::Buffer, wgpu::BindGroup, wgpu::BindGroup) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("font atlas"),
+        size: wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &atlas.pixels,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(atlas.width), // R8, and width=512 is 256-aligned
+            rows_per_image: Some(atlas.height),
+        },
+        wgpu::Extent3d { width: atlas.width, height: atlas.height, depth_or_array_layers: 1 },
+    );
+    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("font sampler"),
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+
+    let u_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("text u bgl"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("text tex bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+
+    let ubuf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("text uniform"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let ubg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("text ubg"),
+        layout: &u_bgl,
+        entries: &[wgpu::BindGroupEntry { binding: 0, resource: ubuf.as_entire_binding() }],
+    });
+    let tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("text tex bg"),
+        layout: &tex_bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+        ],
+    });
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("text shader"),
+        source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("text.wgsl"))),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("text pl layout"),
+        bind_group_layouts: &[&u_bgl, &tex_bgl],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("text pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_main"),
+            compilation_options: Default::default(),
+            buffers: &[wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<TextVertex>() as u64,
+                step_mode: wgpu::VertexStepMode::Vertex,
+                attributes: &[
+                    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
+                    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
+                ],
+            }],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_main"),
+            compilation_options: Default::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    });
+
+    (pipeline, ubuf, ubg, tex_bg)
 }
 
 impl AppState {
@@ -601,9 +784,27 @@ impl AppState {
                 (Some(buf), verts.len() as u32)
             }
         };
+        // Place-name labels from the names layer (point features), as
+        // Mercator-relative anchor points projected per frame at draw time.
+        let mut labels: Vec<(String, String, [f32; 2])> = Vec::new();
+        if let Some(nl) = vt.layer("names") {
+            for feat in &nl.features {
+                if feat.kind != GeomKind::Point {
+                    continue;
+                }
+                if let (Some(name), Some(pt)) =
+                    (feat.attr("name1"), feat.parts.first().and_then(|p| p.first()))
+                {
+                    let kind = feat.attr("type").unwrap_or("").to_string();
+                    let m = tile.mvt_to_mercator(pt[0] as f64, pt[1] as f64);
+                    labels.push((name.to_string(), kind, [(m.x - ox) as f32, (m.y - oy) as f32]));
+                }
+            }
+        }
+
         let (area_buf, area_count) = mk(&areas, "tile areas");
         let (stroke_buf, stroke_count) = mk(&strokes, "tile strokes");
-        TileMesh { area_buf, area_count, stroke_buf, stroke_count }
+        TileMesh { area_buf, area_count, stroke_buf, stroke_count, labels }
     }
 
     /// Reset the pinch reference from the current touch set (called whenever a
@@ -714,10 +915,10 @@ impl AppState {
             }
             let mesh = match self.mbt.decode_tile(t) {
                 Ok(Some(vt)) => self.build_mesh(t, &vt),
-                Ok(None) => TileMesh { area_buf: None, area_count: 0, stroke_buf: None, stroke_count: 0 },
+                Ok(None) => TileMesh { area_buf: None, area_count: 0, stroke_buf: None, stroke_count: 0, labels: Vec::new() },
                 Err(e) => {
                     eprintln!("decode {:?} failed: {e}", t);
-                    TileMesh { area_buf: None, area_count: 0, stroke_buf: None, stroke_count: 0 }
+                    TileMesh { area_buf: None, area_count: 0, stroke_buf: None, stroke_count: 0, labels: Vec::new() }
                 }
             };
             self.tiles.insert(t, mesh);
@@ -744,6 +945,65 @@ impl AppState {
                 _pad: 0.0,
             };
             self.gpu.queue.write_buffer(&self.gpu.path_ubuf, 0, bytemuck::bytes_of(&pu));
+        }
+
+        // Build screen-space label geometry for visible tiles (deduped by name).
+        let mut label_buf: Option<wgpu::Buffer> = None;
+        let mut label_count = 0u32;
+        if self.show_labels {
+            // Gather on-screen candidates passing the per-type zoom threshold.
+            struct Cand<'a> {
+                pr: u8,
+                name: &'a str,
+                sx: f64,
+                sy: f64,
+                w: f64,
+            }
+            let mut cands: Vec<Cand> = Vec::new();
+            for t in &want {
+                let Some(m) = self.tiles.get(t) else { continue };
+                for (name, kind, mp) in &m.labels {
+                    if z < label_min_zoom(kind) {
+                        continue;
+                    }
+                    let sx = (mp[0] as f64 - self.cam.center_x) * self.cam.zoom + self.cam.vw * 0.5;
+                    let sy = self.cam.vh * 0.5 - (mp[1] as f64 - self.cam.center_y) * self.cam.zoom;
+                    if sx < -100.0 || sx > self.cam.vw + 100.0 || sy < -20.0 || sy > self.cam.vh + 20.0 {
+                        continue;
+                    }
+                    cands.push(Cand { pr: label_priority(kind), name, sx, sy, w: self.atlas.measure(name) as f64 });
+                }
+            }
+            // Important first, then a stable key so the same labels win frame to
+            // frame (less flicker while panning).
+            cands.sort_by(|a, b| {
+                a.pr.cmp(&b.pr).then(a.name.cmp(b.name)).then(a.sx.partial_cmp(&b.sx).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            // Greedy collision: place a label only if its box is clear. This also
+            // collapses the duplicate label points Zoomstack repeats per tile.
+            let h = self.atlas.px as f64;
+            let mut boxes: Vec<[f64; 4]> = Vec::new();
+            let mut tv: Vec<TextVertex> = Vec::new();
+            for c in &cands {
+                let (l, t, r, b) = (c.sx - c.w * 0.5, c.sy - h * 0.5, c.sx + c.w * 0.5, c.sy + h * 0.5);
+                if boxes.iter().any(|x| l < x[2] && r > x[0] && t < x[3] && b > x[1]) {
+                    continue;
+                }
+                boxes.push([l, t, r, b]);
+                self.atlas.layout(c.name, (c.sx - c.w * 0.5) as f32, c.sy as f32, &mut tv);
+            }
+            if !tv.is_empty() {
+                label_buf = Some(self.gpu.device.create_buffer_init(
+                    &wgpu::util::BufferInitDescriptor {
+                        label: Some("labels"),
+                        contents: bytemuck::cast_slice(&tv),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    },
+                ));
+                label_count = tv.len() as u32;
+                let tu = [self.cam.vw as f32, self.cam.vh as f32, 0.0, 0.0];
+                self.gpu.queue.write_buffer(&self.text_ubuf, 0, bytemuck::cast_slice(&tu));
+            }
         }
 
         let frame = match self.gpu.surface.get_current_texture() {
@@ -806,6 +1066,16 @@ impl AppState {
                     }
                 }
             }
+            // Place-name labels, screen-aligned, on top of everything.
+            if let Some(buf) = &label_buf {
+                if label_count > 0 {
+                    pass.set_pipeline(&self.text_pipeline);
+                    pass.set_bind_group(0, &self.text_ubg, &[]);
+                    pass.set_bind_group(1, &self.text_tex_bg, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..label_count, 0..1);
+                }
+            }
         }
         self.gpu.queue.submit(Some(enc.finish()));
         frame.present();
@@ -840,6 +1110,14 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let cam = Camera::new(self.at, size.width as f64, size.height as f64);
 
+        // Build the label font atlas from a system font.
+        let font_bytes = std::fs::read(r"C:\Windows\Fonts\segoeui.ttf")
+            .or_else(|_| std::fs::read(r"C:\Windows\Fonts\arial.ttf"))
+            .expect("load a system font");
+        let atlas = FontAtlas::build(&font_bytes, 18.0);
+        let (text_pipeline, text_ubuf, text_ubg, text_tex_bg) =
+            build_text(&gpu.device, &gpu.queue, gpu.config.format, &atlas);
+
         self.state = Some(AppState {
             window,
             gpu,
@@ -858,6 +1136,12 @@ impl ApplicationHandler for App {
             show_paths: false,
             path_buf: None,
             path_count: 0,
+            atlas,
+            show_labels: true,
+            text_pipeline,
+            text_ubuf,
+            text_ubg,
+            text_tex_bg,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -894,6 +1178,14 @@ impl ApplicationHandler for App {
                 }
                 s.window.request_redraw();
                 println!("paths: {}", if s.show_paths { "on" } else { "off" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyL) =>
+            {
+                s.show_labels = !s.show_labels;
+                s.window.request_redraw();
+                println!("labels: {}", if s.show_labels { "on" } else { "off" });
             }
             WindowEvent::Resized(new) => {
                 s.gpu.resize(new.width, new.height);

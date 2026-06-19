@@ -60,8 +60,10 @@ fn style(name: &str) -> Option<Style> {
         "roads" => Stroke([0.28, 0.26, 0.24]),
         "waterlines" => Stroke([0.20, 0.45, 0.80]),
         "contours" => Stroke([0.78, 0.66, 0.50]),
-        "national_parks" => Stroke([0.55, 0.40, 0.55]),
-        _ => return None, // names (points), sites, etc.
+        // NB: don't stroke tile-clipped AREA polygons (e.g. national_parks) — the
+        // clip edges show up as square outlines along every tile boundary. A
+        // proper park-edge line needs a real boundary feature; skip for now.
+        _ => return None, // names (points), sites, national_parks, etc.
     })
 }
 

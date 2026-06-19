@@ -1,7 +1,8 @@
-//! AirHorizon vector map viewer (B3 MVP).
+//! AirHorizon vector map viewer.
 //!
-//! Live-renders OS Open Zoomstack MVT tiles as 1px lines in Web Mercator.
-//! Pan with left-drag, zoom with the wheel. No fills/labels yet (B4/B5).
+//! Live-renders OS Open Zoomstack MVT tiles in Web Mercator: polygon area fills
+//! (earcut) under tessellated thick line strokes (lyon). Mouse drag / wheel and
+//! touch pan + pinch-zoom. Labels are still to come (B5).
 //!
 //!   cargo run -p view --release --offline -- [mbtiles] [lat] [lon]
 
@@ -11,6 +12,9 @@ use std::sync::Arc;
 use basemap::{GeomKind, Mbtiles};
 use bytemuck::{Pod, Zeroable};
 use geodesy::{LatLon, Tile, MERCATOR_MAX};
+use lyon::math::point;
+use lyon::path::Path;
+use lyon::tessellation::{BuffersBuilder, StrokeOptions, StrokeTessellator, StrokeVertex, VertexBuffers};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
@@ -40,11 +44,13 @@ struct ViewUniform {
     y_offset: f32,
 }
 
-/// How a Zoomstack layer is drawn: a filled area or a stroked line.
+/// How a Zoomstack layer is drawn: a filled area, or a stroked line of a given
+/// width. Stroke width is in tile-local units (0..4096); since `slippy_zoom`
+/// keeps a tile ~512 px on screen, `width_px ~= width / 8`.
 #[derive(Clone, Copy)]
 enum Style {
     Fill([f32; 3]),
-    Stroke([f32; 3]),
+    Stroke([f32; 3], f32),
 }
 
 /// Per-layer style, or `None` to skip. Fills are pale so the strokes read on top.
@@ -56,15 +62,44 @@ fn style(name: &str) -> Option<Style> {
         "greenspaces" => Fill([0.86, 0.91, 0.80]),
         "surfacewater" => Fill([0.69, 0.82, 0.92]),
         "buildings" => Fill([0.84, 0.79, 0.76]),
-        // Line strokes, drawn on top.
-        "roads" => Stroke([0.28, 0.26, 0.24]),
-        "waterlines" => Stroke([0.20, 0.45, 0.80]),
-        "contours" => Stroke([0.78, 0.66, 0.50]),
+        // Line strokes, drawn on top (width in tile units; ~/8 = screen px).
+        "roads" => Stroke([0.28, 0.26, 0.24], 22.0),
+        "waterlines" => Stroke([0.20, 0.45, 0.80], 13.0),
+        "contours" => Stroke([0.78, 0.66, 0.50], 6.0),
         // NB: don't stroke tile-clipped AREA polygons (e.g. national_parks) — the
-        // clip edges show up as square outlines along every tile boundary. A
-        // proper park-edge line needs a real boundary feature; skip for now.
+        // clip edges show up as square outlines along every tile boundary.
         _ => return None, // names (points), sites, national_parks, etc.
     })
+}
+
+/// Tessellate a tile-local polyline into triangle vertices (tile-local coords)
+/// of a stroke `width` wide, using lyon. Reuses one tessellator across calls.
+fn stroke_to_tris(tess: &mut StrokeTessellator, points: &[[f32; 2]], width: f32) -> Vec<[f32; 2]> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+    let mut pb = Path::builder();
+    pb.begin(point(points[0][0], points[0][1]));
+    for p in &points[1..] {
+        pb.line_to(point(p[0], p[1]));
+    }
+    pb.end(false);
+    let path = pb.build();
+
+    let mut buffers: VertexBuffers<[f32; 2], u32> = VertexBuffers::new();
+    let opts = StrokeOptions::default().with_line_width(width);
+    let ok = tess.tessellate_path(
+        &path,
+        &opts,
+        &mut BuffersBuilder::new(&mut buffers, |v: StrokeVertex| {
+            let p = v.position();
+            [p.x, p.y]
+        }),
+    );
+    if ok.is_err() {
+        return Vec::new();
+    }
+    buffers.indices.iter().map(|&i| buffers.vertices[i as usize]).collect()
 }
 
 /// Drop a ring's explicit closing vertex (our decoder repeats first==last).
@@ -171,14 +206,14 @@ impl Camera {
     }
 }
 
-/// GPU geometry for one tile: a triangle-list fill mesh and a line-list stroke
-/// mesh. Either may be empty; an all-empty mesh is still cached so the tile
-/// isn't re-decoded.
+/// GPU geometry for one tile: area-fill triangles and stroke triangles (both
+/// TriangleList). Either may be empty; an all-empty mesh is still cached so the
+/// tile isn't re-decoded.
 struct TileMesh {
-    fill_buf: Option<wgpu::Buffer>,
-    fill_count: u32,
-    line_buf: Option<wgpu::Buffer>,
-    line_count: u32,
+    area_buf: Option<wgpu::Buffer>,
+    area_count: u32,
+    stroke_buf: Option<wgpu::Buffer>,
+    stroke_count: u32,
 }
 
 struct Gpu {
@@ -186,8 +221,7 @@ struct Gpu {
     queue: Arc<wgpu::Queue>,
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    line_pipeline: wgpu::RenderPipeline,
-    fill_pipeline: wgpu::RenderPipeline,
+    pipeline: wgpu::RenderPipeline,
     view_buf: wgpu::Buffer,
     view_bg: wgpu::BindGroup,
 }
@@ -276,55 +310,53 @@ impl Gpu {
             bind_group_layouts: &[&view_bgl],
             push_constant_ranges: &[],
         });
-        // Both pipelines share the shader, layout and vertex format; only the
-        // primitive topology differs (lines vs filled triangles).
-        let make_pipeline = |topology: wgpu::PrimitiveTopology, label: &str| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x2,
-                                offset: 0,
-                                shader_location: 0,
-                            },
-                            wgpu::VertexAttribute {
-                                format: wgpu::VertexFormat::Float32x3,
-                                offset: 8,
-                                shader_location: 1,
-                            },
-                        ],
-                    }],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState { topology, ..Default::default() },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            })
-        };
-        let fill_pipeline =
-            make_pipeline(wgpu::PrimitiveTopology::TriangleList, "fill pipeline");
-        let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList, "line pipeline");
+        // One TriangleList pipeline: both area fills and tessellated strokes are
+        // triangles, sharing the shader, layout and vertex format.
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("tri pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<Vertex>() as u64,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
 
-        Self { device, queue, surface, config, line_pipeline, fill_pipeline, view_buf, view_bg }
+        Self { device, queue, surface, config, pipeline, view_buf, view_bg }
     }
 
     fn resize(&mut self, w: u32, h: u32) {
@@ -352,6 +384,8 @@ struct AppState {
     touches: HashMap<u64, (f64, f64)>,
     /// Two-finger reference (midpoint, separation) for the pinch delta.
     pinch_prev: Option<((f64, f64), f64)>,
+    /// Layer visibility toggles (R toggles roads).
+    show_roads: bool,
 }
 
 impl AppState {
@@ -365,21 +399,24 @@ impl AppState {
             Vertex { pos: [(m.x - ox) as f32, (m.y - oy) as f32], color }
         };
 
-        let mut fills: Vec<Vertex> = Vec::new();
-        let mut lines: Vec<Vertex> = Vec::new();
+        let mut areas: Vec<Vertex> = Vec::new();
+        let mut strokes: Vec<Vertex> = Vec::new();
+        let mut tess = StrokeTessellator::new();
 
         for layer in &vt.layers {
             let Some(st) = style(&layer.name) else { continue };
+            if !self.show_roads && layer.name == "roads" {
+                continue;
+            }
             match st {
-                Style::Stroke(color) => {
+                Style::Stroke(color, width) => {
                     for feat in &layer.features {
                         if feat.kind == GeomKind::Point {
                             continue;
                         }
                         for part in &feat.parts {
-                            for seg in part.windows(2) {
-                                lines.push(to_vertex(seg[0], color));
-                                lines.push(to_vertex(seg[1], color));
+                            for p in stroke_to_tris(&mut tess, part, width) {
+                                strokes.push(to_vertex(p, color));
                             }
                         }
                     }
@@ -421,7 +458,7 @@ impl AppState {
                             }
                             if let Ok(idx) = earcutr::earcut(&data, &holes, 2) {
                                 for i in idx {
-                                    fills.push(to_vertex(flat[i], color));
+                                    areas.push(to_vertex(flat[i], color));
                                 }
                             }
                         }
@@ -442,9 +479,9 @@ impl AppState {
                 (Some(buf), verts.len() as u32)
             }
         };
-        let (fill_buf, fill_count) = mk(&fills, "tile fills");
-        let (line_buf, line_count) = mk(&lines, "tile lines");
-        TileMesh { fill_buf, fill_count, line_buf, line_count }
+        let (area_buf, area_count) = mk(&areas, "tile areas");
+        let (stroke_buf, stroke_count) = mk(&strokes, "tile strokes");
+        TileMesh { area_buf, area_count, stroke_buf, stroke_count }
     }
 
     /// Reset the pinch reference from the current touch set (called whenever a
@@ -492,10 +529,10 @@ impl AppState {
             }
             let mesh = match self.mbt.decode_tile(t) {
                 Ok(Some(vt)) => self.build_mesh(t, &vt),
-                Ok(None) => TileMesh { fill_buf: None, fill_count: 0, line_buf: None, line_count: 0 },
+                Ok(None) => TileMesh { area_buf: None, area_count: 0, stroke_buf: None, stroke_count: 0 },
                 Err(e) => {
                     eprintln!("decode {:?} failed: {e}", t);
-                    TileMesh { fill_buf: None, fill_count: 0, line_buf: None, line_count: 0 }
+                    TileMesh { area_buf: None, area_count: 0, stroke_buf: None, stroke_count: 0 }
                 }
             };
             self.tiles.insert(t, mesh);
@@ -539,20 +576,19 @@ impl AppState {
                 occlusion_query_set: None,
             });
             pass.set_bind_group(0, &self.gpu.view_bg, &[]);
-            // Fills underneath...
-            pass.set_pipeline(&self.gpu.fill_pipeline);
+            pass.set_pipeline(&self.gpu.pipeline);
+            // Area fills underneath...
             for &t in &want {
-                if let Some(TileMesh { fill_buf: Some(buf), fill_count, .. }) = self.tiles.get(&t) {
+                if let Some(TileMesh { area_buf: Some(buf), area_count, .. }) = self.tiles.get(&t) {
                     pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.draw(0..*fill_count, 0..1);
+                    pass.draw(0..*area_count, 0..1);
                 }
             }
-            // ...strokes on top.
-            pass.set_pipeline(&self.gpu.line_pipeline);
+            // ...stroked lines on top.
             for &t in &want {
-                if let Some(TileMesh { line_buf: Some(buf), line_count, .. }) = self.tiles.get(&t) {
+                if let Some(TileMesh { stroke_buf: Some(buf), stroke_count, .. }) = self.tiles.get(&t) {
                     pass.set_vertex_buffer(0, buf.slice(..));
-                    pass.draw(0..*line_count, 0..1);
+                    pass.draw(0..*stroke_count, 0..1);
                 }
             }
         }
@@ -600,6 +636,7 @@ impl ApplicationHandler for App {
             last_cursor: None,
             touches: HashMap::new(),
             pinch_prev: None,
+            show_roads: true,
         });
         self.state.as_ref().unwrap().window.request_redraw();
     }
@@ -613,6 +650,15 @@ impl ApplicationHandler for App {
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
             {
                 event_loop.exit();
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyR) =>
+            {
+                s.show_roads = !s.show_roads;
+                s.tiles.clear(); // rebuild meshes with/without the roads layer
+                s.window.request_redraw();
+                println!("roads: {}", if s.show_roads { "on" } else { "off" });
             }
             WindowEvent::Resized(new) => {
                 s.gpu.resize(new.width, new.height);

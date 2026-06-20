@@ -286,3 +286,163 @@ pub fn visible_peaks<'a>(
     }
     out
 }
+
+/// A boolean "is water here" raster over a British National Grid area, built by
+/// rasterising water-body polygons. Lets the horizon cast tell water apart from
+/// ordinary low ground (the DEM can't).
+pub struct WaterMask {
+    e0: f64,
+    n0: f64,
+    cell: f64,
+    nx: usize,
+    ny: usize,
+    bits: Vec<bool>,
+}
+
+impl WaterMask {
+    /// Rasterise BNG polygons (rings of [e, n]; holes not handled) into a grid
+    /// with south-west corner (e0, n0), `cell` m, `nx`×`ny` cells.
+    pub fn from_polygons(
+        e0: f64,
+        n0: f64,
+        cell: f64,
+        nx: usize,
+        ny: usize,
+        polys: &[Vec<[f64; 2]>],
+    ) -> Self {
+        let mut bits = vec![false; nx * ny];
+        for poly in polys {
+            if poly.len() < 4 {
+                continue;
+            }
+            let (mut emin, mut emax, mut nmin, mut nmax) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+            for p in poly {
+                emin = emin.min(p[0]);
+                emax = emax.max(p[0]);
+                nmin = nmin.min(p[1]);
+                nmax = nmax.max(p[1]);
+            }
+            let cx0 = (((emin - e0) / cell).floor().max(0.0)) as usize;
+            let cy0 = (((nmin - n0) / cell).floor().max(0.0)) as usize;
+            let cx1 = (((emax - e0) / cell).ceil().max(0.0) as usize).min(nx);
+            let cy1 = (((nmax - n0) / cell).ceil().max(0.0) as usize).min(ny);
+            for cy in cy0..cy1 {
+                for cx in cx0..cx1 {
+                    let e = e0 + (cx as f64 + 0.5) * cell;
+                    let n = n0 + (cy as f64 + 0.5) * cell;
+                    if point_in_poly(e, n, poly) {
+                        bits[cy * nx + cx] = true;
+                    }
+                }
+            }
+        }
+        WaterMask { e0, n0, cell, nx, ny, bits }
+    }
+
+    /// Stamp a BNG polyline (e.g. a river centreline) into the mask, marking
+    /// every cell it passes through plus `buf` cells either side.
+    pub fn add_line(&mut self, line: &[[f64; 2]], buf: i64) {
+        for w in line.windows(2) {
+            let (ax, ay) = (w[0][0], w[0][1]);
+            let (bx, by) = (w[1][0], w[1][1]);
+            let len = (bx - ax).hypot(by - ay).max(1.0);
+            let steps = (len / (self.cell * 0.5)).ceil() as i64;
+            for s in 0..=steps {
+                let t = s as f64 / steps as f64;
+                let cx = (((ax + (bx - ax) * t) - self.e0) / self.cell).floor() as i64;
+                let cy = (((ay + (by - ay) * t) - self.n0) / self.cell).floor() as i64;
+                for dy in -buf..=buf {
+                    for dx in -buf..=buf {
+                        let (gx, gy) = (cx + dx, cy + dy);
+                        if gx >= 0 && gy >= 0 && (gx as usize) < self.nx && (gy as usize) < self.ny {
+                            self.bits[gy as usize * self.nx + gx as usize] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn is_water(&self, e: f64, n: f64) -> bool {
+        let cx = ((e - self.e0) / self.cell).floor();
+        let cy = ((n - self.n0) / self.cell).floor();
+        if cx < 0.0 || cy < 0.0 {
+            return false;
+        }
+        let (cx, cy) = (cx as usize, cy as usize);
+        cx < self.nx && cy < self.ny && self.bits[cy * self.nx + cx]
+    }
+}
+
+fn point_in_poly(e: f64, n: f64, ring: &[[f64; 2]]) -> bool {
+    let mut inside = false;
+    let mut j = ring.len() - 1;
+    for i in 0..ring.len() {
+        let (xi, yi) = (ring[i][0], ring[i][1]);
+        let (xj, yj) = (ring[j][0], ring[j][1]);
+        if (yi > n) != (yj > n) && e < (xj - xi) * (n - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Per azimuth bucket, the *contiguous segments* of visible water as
+/// apparent-elevation bands `(top, bottom)` (radians). Each segment is one
+/// stretch of unoccluded water surface along the ray; separate lakes (or a lake
+/// then a farther one across intervening land) stay separate segments so the
+/// renderer doesn't fill the gap. Water sits below eye level (angle rises with
+/// distance); a sample shows when not occluded by nearer, higher terrain.
+pub fn visible_water(
+    dem: &Dem,
+    viewpoint: LatLon,
+    params: &HorizonParams,
+    mask: &WaterMask,
+) -> Vec<Vec<(f32, f32)>> {
+    let (eye_e, eye_n) = geodesy::wgs84_to_bng(viewpoint.lat, viewpoint.lon);
+    let h_eye = dem.elevation_bng(eye_e, eye_n).unwrap_or(0.0) + params.eye_height_m;
+    let r_eff = EARTH_RADIUS_M / (1.0 - params.refraction_k);
+
+    let mut out: Vec<Vec<(f32, f32)>> = vec![Vec::new(); AZIMUTH_BUCKETS];
+    for i in 0..AZIMUTH_BUCKETS {
+        let az = i as f64 * 0.1 * PI / 180.0;
+        let (dx, dy) = (az.sin(), az.cos());
+        // Bridge short gaps (occlusion/sampling noise, common when a lake is seen
+        // edge-on from near its own level) so a run stays one band, not dashes.
+        const MAX_GAP: i32 = 5;
+        let mut run_max = -PI / 2.0;
+        let mut seg: Option<(f32, f32)> = None; // (top, bottom) of the current run
+        let mut gap = 0;
+        let mut d = 50.0;
+        while d <= params.max_range_m {
+            let (e, n) = (eye_e + dx * d, eye_n + dy * d);
+            if let Some(h_t) = dem.elevation_bng(e, n) {
+                let curve_drop = d * d / (2.0 * r_eff);
+                let ang = (((h_t - h_eye - curve_drop) / d).atan()) as f32;
+                let here = ang >= run_max as f32 && mask.is_water(e, n);
+                if here {
+                    seg = Some(match seg {
+                        Some((t, b)) => (t.max(ang), b.min(ang)),
+                        None => (ang, ang),
+                    });
+                    gap = 0;
+                } else if seg.is_some() {
+                    gap += 1;
+                    if gap > MAX_GAP {
+                        out[i].push(seg.take().unwrap()); // run really ended
+                        gap = 0;
+                    }
+                }
+                if ang as f64 > run_max {
+                    run_max = ang as f64;
+                }
+            }
+            d += (d * 0.015).clamp(30.0, 600.0);
+        }
+        if let Some(s) = seg.take() {
+            out[i].push(s);
+        }
+    }
+    out
+}

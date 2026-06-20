@@ -17,7 +17,7 @@ use basemap::{GeomKind, Mbtiles};
 use bytemuck::{Pod, Zeroable};
 use dem::Dem;
 use geodesy::{LatLon, Mercator, Tile, MERCATOR_MAX};
-use horizon::{cast, visible_peaks, HorizonParams, Visibility};
+use horizon::{cast, visible_peaks, visible_water, HorizonParams, Visibility, WaterMask};
 use mapdata::{load_paths, PathKind};
 use peaks::Peaks;
 use lyon::math::point;
@@ -114,6 +114,7 @@ struct PanoState {
     skyline: Vec<f32>, // horizon::AZIMUTH_BUCKETS elevation angles (radians)
     edge_lines: Vec<Vec<(f32, f32)>>, // linked occlusion edges: (azimuth_deg, elev_rad)
     edge_top: Vec<f32>, // per bucket: highest occlusion-edge elev (rad), or -inf
+    water: Vec<Vec<(f32, f32)>>, // per bucket: visible-water segments (top, bottom) elev (rad)
     peaks: Vec<PanoPeak>,
 }
 
@@ -621,6 +622,7 @@ struct AppState {
     dem: Option<Dem>,
     pano: Option<PanoState>,
     show_edges: bool,
+    show_water: bool,
     /// Panorama render style: false = clean/natural, true = pen-and-ink artist view.
     artist: bool,
 }
@@ -967,6 +969,52 @@ impl AppState {
         );
     }
 
+    /// Gather Zoomstack water within `radius_m` of `vp` as BNG geometry: lake
+    /// polygons (`surfacewater`) and river centrelines (`waterlines`).
+    fn gather_water_bng(&self, vp: LatLon, radius_m: f64) -> (Vec<Vec<[f64; 2]>>, Vec<Vec<[f64; 2]>>) {
+        let z = 12u8;
+        let dlat = radius_m / 111_320.0;
+        let dlon = radius_m / (111_320.0 * vp.lat.to_radians().cos().abs().max(0.01));
+        let t_nw = Tile::containing(LatLon::new(vp.lat + dlat, vp.lon - dlon), z);
+        let t_se = Tile::containing(LatLon::new(vp.lat - dlat, vp.lon + dlon), z);
+        let (mut polys, mut lines) = (Vec::new(), Vec::new());
+        for ty in t_nw.y..=t_se.y {
+            for tx in t_nw.x..=t_se.x {
+                let tile = Tile::new(z, tx, ty);
+                let Ok(Some(vt)) = self.mbt.decode_tile(tile) else { continue };
+                let to_bng = |p: [f32; 2]| {
+                    let m = tile.mvt_to_mercator(p[0] as f64, p[1] as f64);
+                    let ll = m.to_latlon();
+                    let (e, n) = geodesy::wgs84_to_bng(ll.lat, ll.lon);
+                    [e, n]
+                };
+                if let Some(layer) = vt.layer("surfacewater") {
+                    for f in &layer.features {
+                        if f.kind == GeomKind::Polygon {
+                            for ring in &f.parts {
+                                if ring.len() >= 4 {
+                                    polys.push(ring.iter().map(|&p| to_bng(p)).collect());
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(layer) = vt.layer("waterlines") {
+                    for f in &layer.features {
+                        if f.kind == GeomKind::Line {
+                            for part in &f.parts {
+                                if part.len() >= 2 {
+                                    lines.push(part.iter().map(|&p| to_bng(p)).collect());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (polys, lines)
+    }
+
     /// Cast the horizon from the current map centre and switch to panorama mode.
     /// DEM loads lazily on first use.
     fn enter_panorama(&mut self) {
@@ -1007,6 +1055,18 @@ impl AppState {
                 obscured: v.visibility == Visibility::Slopes,
             })
             .collect();
+        // Visible water: rasterise nearby lakes to a BNG mask, then cast. (Rivers
+        // are deliberately NOT stamped — every Zoomstack beck floods the valleys.)
+        let radius = 22_000.0;
+        let (polys, _lines) = self.gather_water_bng(vp, radius);
+        let (eye_e, eye_n) = geodesy::wgs84_to_bng(vp.lat, vp.lon);
+        let cell = 50.0;
+        let ncells = ((2.0 * radius) / cell) as usize;
+        let mask =
+            WaterMask::from_polygons(eye_e - radius, eye_n - radius, cell, ncells, ncells, &polys);
+        let water = visible_water(dem, vp, &params, &mask);
+        println!("panorama: {} lakes in range", polys.len());
+
         // Visible summits first, then nearer peaks, win the name-collision pass.
         peaks.sort_by(|a, b| {
             a.obscured
@@ -1032,6 +1092,7 @@ impl AppState {
                 .map(|v| v.iter().map(|&(e, _)| e).fold(f32::NEG_INFINITY, f32::max))
                 .collect(),
             edge_lines: h.edge_polylines(),
+            water,
             skyline: h.elev_rad,
             peaks,
         });
@@ -1097,6 +1158,27 @@ impl AppState {
                 tri(x, y - t, px, py + t, x, y + t, sky_line);
             }
             prev = Some((x, y));
+        }
+
+        // Visible water surface (lakes) as a blue band sitting in the valley,
+        // drawn over the terrain fill.
+        if self.show_water {
+            let water_c = if artist { [0.55, 0.63, 0.74] } else { [0.28, 0.50, 0.80] };
+            let strip_w = (px_per_deg * 0.1) as f32 + 1.0; // one bucket wide, slight overlap
+            for b in start..=end {
+                let bucket = b.rem_euclid(buckets) as usize;
+                if pano.water[bucket].is_empty() {
+                    continue;
+                }
+                let x = az_to_x(b as f64 * 0.1);
+                for &(wt, wb) in &pano.water[bucket] {
+                    let yt = elev_to_y((wt as f64).to_degrees());
+                    let yb = (elev_to_y((wb as f64).to_degrees())).max(yt + 1.0); // >=1px tall
+                    // vertical strip [x, x+strip_w] x [yt, yb]
+                    tri(x, yt, x, yb, x + strip_w, yt, water_c);
+                    tri(x + strip_w, yt, x, yb, x + strip_w, yb, water_c);
+                }
+            }
         }
 
         // Eye-level (0 deg) reference line.
@@ -1194,7 +1276,7 @@ impl AppState {
 
         // HUD hint.
         let hud = format!(
-            "PANORAMA {} ({:.4}, {:.4})  ground {:.0} m   (V:map  drag:scrub  wheel:zoom  N:names  E:edges  A:style)",
+            "PANORAMA {} ({:.4}, {:.4})  ground {:.0} m   (V:map  drag:scrub  wheel:zoom  N:names  E:edges  W:water  A:style)",
             if artist { "[artist]" } else { "[natural]" },
             pano.viewpoint.lat,
             pano.viewpoint.lon,
@@ -1670,6 +1752,7 @@ impl ApplicationHandler for App {
             dem: None,
             pano: None,
             show_edges: true,
+            show_water: true,
             artist: false,
         });
         self.state.as_ref().unwrap().window.request_redraw();
@@ -1718,6 +1801,14 @@ impl ApplicationHandler for App {
                 s.artist = !s.artist;
                 s.window.request_redraw();
                 println!("panorama style: {}", if s.artist { "artist" } else { "natural" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyW) =>
+            {
+                s.show_water = !s.show_water;
+                s.window.request_redraw();
+                println!("water: {}", if s.show_water { "on" } else { "off" });
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed

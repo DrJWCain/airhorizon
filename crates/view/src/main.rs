@@ -92,6 +92,7 @@ const DEM_DIR: &str = r"C:\maps\OS Terrain 50";
 enum Mode {
     Map,
     Panorama,
+    Compass,
 }
 
 /// A peak placed on the synthetic panorama.
@@ -633,6 +634,33 @@ fn jitter(i: u32) -> f32 {
     ((x >> 8) & 0xffff) as f32 / 65_535.0
 }
 
+/// Push a thick screen-space line segment (two triangles) sampling the solid
+/// texel — used by the compass view for rings, arms and cardinals.
+fn push_seg(tv: &mut Vec<TextVertex>, uv: [f32; 2], x0: f32, y0: f32, x1: f32, y1: f32, t: f32, c: [f32; 3]) {
+    let (dx, dy) = (x1 - x0, y1 - y0);
+    let l = (dx * dx + dy * dy).sqrt().max(1e-3);
+    let (nx, ny) = (-dy / l * t, dx / l * t);
+    tv.push(TextVertex { pos: [x0 + nx, y0 + ny], uv, color: c });
+    tv.push(TextVertex { pos: [x0 - nx, y0 - ny], uv, color: c });
+    tv.push(TextVertex { pos: [x1 + nx, y1 + ny], uv, color: c });
+    tv.push(TextVertex { pos: [x1 + nx, y1 + ny], uv, color: c });
+    tv.push(TextVertex { pos: [x0 - nx, y0 - ny], uv, color: c });
+    tv.push(TextVertex { pos: [x1 - nx, y1 - ny], uv, color: c });
+}
+
+fn push_circle(tv: &mut Vec<TextVertex>, uv: [f32; 2], cx: f32, cy: f32, rad: f32, t: f32, c: [f32; 3]) {
+    let n = 96;
+    let mut prev: Option<(f32, f32)> = None;
+    for k in 0..=n {
+        let th = k as f32 / n as f32 * std::f32::consts::TAU;
+        let (x, y) = (cx + rad * th.cos(), cy + rad * th.sin());
+        if let Some((px, py)) = prev {
+            push_seg(tv, uv, px, py, x, y, t, c);
+        }
+        prev = Some((x, y));
+    }
+}
+
 /// Build the text rendering resources: upload the atlas as an R8 texture and
 /// make the pipeline (screen-px quads sampling coverage as alpha). Returns
 /// (pipeline, viewport-uniform buffer, uniform bind group, texture bind group).
@@ -1015,9 +1043,31 @@ impl AppState {
         (polys, lines)
     }
 
-    /// Cast the horizon from the current map centre and switch to panorama mode.
-    /// DEM loads lazily on first use.
-    fn enter_panorama(&mut self) {
+    /// Switch view mode, casting the horizon from the current map centre when
+    /// entering a horizon view (panorama/compass) fresh from the map.
+    fn set_mode(&mut self, target: Mode) {
+        if target != Mode::Map && (self.mode == Mode::Map || self.pano.is_none()) {
+            self.compute_pano();
+        }
+        if target == Mode::Map || self.pano.is_some() {
+            self.mode = target;
+        }
+        self.window.request_redraw();
+    }
+
+    /// Cycle Map -> Panorama -> Compass -> Map (the on-screen button / no arg).
+    fn cycle_mode(&mut self) {
+        let next = match self.mode {
+            Mode::Map => Mode::Panorama,
+            Mode::Panorama => Mode::Compass,
+            Mode::Compass => Mode::Map,
+        };
+        self.set_mode(next);
+    }
+
+    /// Cast the horizon + visible peaks/water from the current map centre into
+    /// `self.pano`. DEM loads lazily on first use.
+    fn compute_pano(&mut self) {
         let m = Mercator::new(
             self.cam.origin_x + self.cam.center_x,
             self.cam.origin_y + self.cam.center_y,
@@ -1096,8 +1146,6 @@ impl AppState {
             skyline: h.elev_rad,
             peaks,
         });
-        self.mode = Mode::Panorama;
-        self.window.request_redraw();
     }
 
     /// Render the synthetic panorama: sky, terrain fill under the skyline, the
@@ -1332,6 +1380,141 @@ impl AppState {
         frame.present();
     }
 
+    /// Compass / plan view: you at the centre, each visible fell on its bearing
+    /// (north up, clockwise) at a radius set by its distance in miles, with an
+    /// arm and a labelled dot. Distance rings in miles.
+    fn render_compass(&mut self) {
+        let Some(pano) = self.pano.as_ref() else { return };
+        let (vw, vh) = (self.cam.vw, self.cam.vh);
+        let (vwf, vhf) = (vw as f32, vh as f32);
+        let (cx, cy) = (vwf * 0.5, vhf * 0.5);
+        let uv = self.atlas.solid_uv();
+        let artist = self.artist;
+
+        let bg = if artist {
+            wgpu::Color { r: 0.93, g: 0.89, b: 0.80, a: 1.0 }
+        } else {
+            wgpu::Color { r: 0.96, g: 0.96, b: 0.95, a: 1.0 }
+        };
+        let ink = if artist { [0.20, 0.13, 0.06] } else { [0.15, 0.15, 0.18] };
+        let ring_c = if artist { [0.62, 0.54, 0.40] } else { [0.70, 0.72, 0.76] };
+        let arm_c = if artist { [0.55, 0.47, 0.34] } else { [0.62, 0.66, 0.72] };
+        let peak_c = if artist { [0.45, 0.20, 0.04] } else { PEAK_LABEL_COLOR };
+        let slope_c = if artist { [0.40, 0.30, 0.18] } else { SLOPE_LABEL_COLOR };
+
+        let r_px = (vw.min(vh) as f32) * 0.44;
+        let max_mi = pano
+            .peaks
+            .iter()
+            .map(|p| p.dist_km * 0.621_371)
+            .fold(1.0_f64, f64::max)
+            .min(25.0) as f32;
+        let scale = r_px / max_mi.max(1.0);
+
+        let mut tv: Vec<TextVertex> = Vec::new();
+
+        // Distance rings (miles) + ring labels.
+        for &mi in &[1.0f32, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 25.0] {
+            if mi > max_mi + 0.01 {
+                break;
+            }
+            push_circle(&mut tv, uv, cx, cy, mi * scale, 0.8, ring_c);
+        }
+        // Cardinal radials + letters (north up, clockwise).
+        for (deg, lbl) in [(0.0f32, "N"), (90.0, "E"), (180.0, "S"), (270.0, "W")] {
+            let a = deg.to_radians();
+            let (ex, ey) = (cx + r_px * a.sin(), cy - r_px * a.cos());
+            push_seg(&mut tv, uv, cx, cy, ex, ey, 0.5, ring_c);
+            let (lx, ly) = (cx + (r_px + 14.0) * a.sin(), cy - (r_px + 14.0) * a.cos());
+            let w = self.atlas.measure(lbl);
+            self.atlas.layout(lbl, lx - w * 0.5, ly + 5.0, ink, &mut tv);
+        }
+
+        // Arms + dots to each visible fell (peaks are pre-sorted: summits then
+        // nearer first, so they win the label-collision pass).
+        let mut placed: Vec<[f32; 4]> = Vec::new();
+        let h = self.atlas.px;
+        for pk in &pano.peaks {
+            let mi = (pk.dist_km * 0.621_371) as f32;
+            let r = (mi * scale).min(r_px);
+            let a = (pk.bearing_deg as f32).to_radians();
+            let (px, py) = (cx + r * a.sin(), cy - r * a.cos());
+            let c = if pk.obscured { slope_c } else { peak_c };
+            push_seg(&mut tv, uv, cx, cy, px, py, 0.6, arm_c);
+            self.atlas.rect(px - 2.0, py - 2.0, px + 2.0, py + 2.0, c, &mut tv);
+
+            // Label just outside the dot, pushed radially outward; collision-skip.
+            let label = format!("{} {:.1}mi", pk.name, mi);
+            let lw = self.atlas.measure(&label);
+            let outward = if a.sin() >= 0.0 { 6.0 } else { -6.0 - lw };
+            let lx = px + outward;
+            let ly = py + 4.0;
+            let box_ = [lx, ly - h, lx + lw, ly];
+            if placed.iter().any(|b| lx < b[2] && box_[2] > b[0] && box_[1] < b[3] && ly > b[1]) {
+                continue;
+            }
+            placed.push(box_);
+            self.atlas.layout(&label, lx, ly, c, &mut tv);
+        }
+        // You-are-here marker.
+        self.atlas.rect(cx - 3.0, cy - 3.0, cx + 3.0, cy + 3.0, ink, &mut tv);
+
+        self.atlas.layout(
+            &format!(
+                "COMPASS  ({:.4}, {:.4})  ground {:.0} m   (rings = miles, N up;  C/V/button: views)",
+                pano.viewpoint.lat, pano.viewpoint.lon, pano.ground_m
+            ),
+            8.0,
+            22.0,
+            ink,
+            &mut tv,
+        );
+        self.draw_mode_button(&mut tv);
+
+        // Upload + draw through the text pipeline.
+        let tu = [vwf, vhf, 0.0, 0.0];
+        self.gpu.queue.write_buffer(&self.text_ubuf, 0, bytemuck::cast_slice(&tu));
+        let buf = self.gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("compass"),
+            contents: bytemuck::cast_slice(&tv),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let frame = match self.gpu.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(_) => {
+                self.gpu.surface.configure(&self.gpu.device, &self.gpu.config);
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc = self
+            .gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("compass enc") });
+        {
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("compass pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(bg), store: wgpu::StoreOp::Store },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            if !tv.is_empty() {
+                pass.set_pipeline(&self.text_pipeline);
+                pass.set_bind_group(0, &self.text_ubg, &[]);
+                pass.set_bind_group(1, &self.text_tex_bg, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..tv.len() as u32, 0..1);
+            }
+        }
+        self.gpu.queue.submit(Some(enc.finish()));
+        frame.present();
+    }
+
     /// Draw the bottom-right key legend onto the text vertex list: a dark panel
     /// plus one line per toggle, white when on / grey when off.
     fn draw_legend(&self, tv: &mut Vec<TextVertex>) {
@@ -1360,9 +1543,11 @@ impl AppState {
 
     /// Bottom-left mode-toggle button: returns its screen rect and label.
     fn mode_button(&self) -> ([f32; 4], &'static str) {
+        // Shows the next mode in the cycle (what a tap switches to).
         let label = match self.mode {
             Mode::Map => "PANORAMA",
-            Mode::Panorama => "MAP",
+            Mode::Panorama => "COMPASS",
+            Mode::Compass => "MAP",
         };
         let w = self.atlas.measure(label) + 20.0;
         let h = 32.0;
@@ -1383,18 +1568,15 @@ impl AppState {
     }
 
     fn toggle_mode(&mut self) {
-        match self.mode {
-            Mode::Map => self.enter_panorama(),
-            Mode::Panorama => {
-                self.mode = Mode::Map;
-                self.window.request_redraw();
-            }
-        }
+        self.cycle_mode();
     }
 
     fn render(&mut self) {
         if self.mode == Mode::Panorama {
             return self.render_panorama();
+        }
+        if self.mode == Mode::Compass {
+            return self.render_compass();
         }
         let z = self.cam.slippy_zoom(self.maxzoom);
         let ((tx0, ty0), (tx1, ty1)) = self.cam.visible_tiles(z);
@@ -1766,10 +1948,9 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::Escape) =>
             {
-                // Esc leaves the panorama first, otherwise quits.
-                if s.mode == Mode::Panorama {
-                    s.mode = Mode::Map;
-                    s.window.request_redraw();
+                // Esc returns to the map first, otherwise quits.
+                if s.mode != Mode::Map {
+                    s.set_mode(Mode::Map);
                 } else {
                     event_loop.exit();
                 }
@@ -1778,13 +1959,13 @@ impl ApplicationHandler for App {
                 if event.state == ElementState::Pressed
                     && event.physical_key == PhysicalKey::Code(KeyCode::KeyV) =>
             {
-                match s.mode {
-                    Mode::Map => s.enter_panorama(),
-                    Mode::Panorama => {
-                        s.mode = Mode::Map;
-                        s.window.request_redraw();
-                    }
-                }
+                s.set_mode(if s.mode == Mode::Panorama { Mode::Map } else { Mode::Panorama });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyC) =>
+            {
+                s.set_mode(if s.mode == Mode::Compass { Mode::Map } else { Mode::Compass });
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -1891,6 +2072,7 @@ impl ApplicationHandler for App {
                                         (p.center_az - (pos.0 - lx) * p.fov_deg / s.cam.vw).rem_euclid(360.0);
                                 }
                             }
+                            Mode::Compass => {}
                         }
                         s.window.request_redraw();
                     }
@@ -1924,6 +2106,7 @@ impl ApplicationHandler for App {
                                                     .rem_euclid(360.0);
                                             }
                                         }
+                                        Mode::Compass => {}
                                     }
                                     s.window.request_redraw();
                                 }
@@ -1952,6 +2135,7 @@ impl ApplicationHandler for App {
                                                     .rem_euclid(360.0);
                                             }
                                         }
+                                        Mode::Compass => {}
                                     }
                                     s.window.request_redraw();
                                 }
@@ -1981,6 +2165,7 @@ impl ApplicationHandler for App {
                             p.fov_deg = (p.fov_deg * 1.1f64.powf(-scroll)).clamp(20.0, 160.0);
                         }
                     }
+                    Mode::Compass => {}
                 }
                 s.window.request_redraw();
             }

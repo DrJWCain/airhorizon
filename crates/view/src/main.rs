@@ -648,6 +648,19 @@ fn push_seg(tv: &mut Vec<TextVertex>, uv: [f32; 2], x0: f32, y0: f32, x1: f32, y
     tv.push(TextVertex { pos: [x1 - nx, y1 - ny], uv, color: c });
 }
 
+/// Filled fan (triangle wedge / disc) over a bearing range, north up clockwise:
+/// a0/a1 in radians, 0 = up. Used by the panorama's orientation compass.
+fn push_fan(tv: &mut Vec<TextVertex>, uv: [f32; 2], cx: f32, cy: f32, rad: f32, a0: f32, a1: f32, c: [f32; 3]) {
+    let n = 32;
+    for k in 0..n {
+        let t0 = a0 + (a1 - a0) * (k as f32 / n as f32);
+        let t1 = a0 + (a1 - a0) * ((k + 1) as f32 / n as f32);
+        tv.push(TextVertex { pos: [cx, cy], uv, color: c });
+        tv.push(TextVertex { pos: [cx + rad * t0.sin(), cy - rad * t0.cos()], uv, color: c });
+        tv.push(TextVertex { pos: [cx + rad * t1.sin(), cy - rad * t1.cos()], uv, color: c });
+    }
+}
+
 fn push_circle(tv: &mut Vec<TextVertex>, uv: [f32; 2], cx: f32, cy: f32, rad: f32, t: f32, c: [f32; 3]) {
     let n = 96;
     let mut prev: Option<(f32, f32)> = None;
@@ -1331,6 +1344,63 @@ impl AppState {
             pano.ground_m
         );
         self.atlas.layout(&hud, 8.0, 22.0, pal_text, &mut tv);
+
+        // Orientation compass-rose, top-right: north-up bezel with cardinal
+        // marks, a faint field-of-view wedge, and a two-tone needle arrow
+        // pointing the way you're looking (rotates as you scrub).
+        {
+            let cr = 46.0_f32;
+            let ccx = vwf - 18.0 - cr;
+            let ccy = 18.0 + cr;
+            let disc = if artist { [0.94, 0.90, 0.81] } else { [0.98, 0.98, 0.97] };
+            let ring = if artist { [0.24, 0.16, 0.08] } else { [0.16, 0.16, 0.22] };
+            let wedge = if artist { [0.82, 0.68, 0.45] } else { [0.80, 0.86, 0.95] };
+            let needle_n = if artist { [0.62, 0.16, 0.06] } else { [0.82, 0.14, 0.12] };
+            let needle_s = if artist { [0.85, 0.80, 0.70] } else { [0.93, 0.93, 0.95] };
+            let ca = (pano.center_az as f32).to_radians();
+            let half = (pano.fov_deg as f32 * 0.5).to_radians();
+
+            push_fan(&mut tv, suv, ccx, ccy, cr, 0.0, std::f32::consts::TAU, disc);
+            push_fan(&mut tv, suv, ccx, ccy, cr, ca - half, ca + half, wedge); // FOV slice
+            push_circle(&mut tv, suv, ccx, ccy, cr, 1.6, ring); // bezel
+            push_circle(&mut tv, suv, ccx, ccy, cr - 4.0, 0.8, ring);
+
+            // Eight tick marks (cardinals longer).
+            for k in 0..8 {
+                let a = k as f32 / 8.0 * std::f32::consts::TAU;
+                let inner = if k % 2 == 0 { cr - 10.0 } else { cr - 6.0 };
+                let (sx, sy) = (ccx + inner * a.sin(), ccy - inner * a.cos());
+                let (ex, ey) = (ccx + (cr - 1.0) * a.sin(), ccy - (cr - 1.0) * a.cos());
+                push_seg(&mut tv, suv, sx, sy, ex, ey, if k % 2 == 0 { 1.4 } else { 0.8 }, ring);
+            }
+
+            // Needle arrow toward the view centre: red head, pale tail.
+            let d = (ca.sin(), -ca.cos()); // forward (screen)
+            let p = (ca.cos(), ca.sin()); // perpendicular
+            let w = 5.5;
+            let (b0x, b0y) = (ccx + p.0 * w, ccy + p.1 * w);
+            let (b1x, b1y) = (ccx - p.0 * w, ccy - p.1 * w);
+            let (tipx, tipy) = (ccx + d.0 * (cr - 7.0), ccy + d.1 * (cr - 7.0));
+            let (tailx, taily) = (ccx - d.0 * (cr * 0.5), ccy - d.1 * (cr * 0.5));
+            tv.push(TextVertex { pos: [tipx, tipy], uv: suv, color: needle_n });
+            tv.push(TextVertex { pos: [b0x, b0y], uv: suv, color: needle_n });
+            tv.push(TextVertex { pos: [b1x, b1y], uv: suv, color: needle_n });
+            tv.push(TextVertex { pos: [tailx, taily], uv: suv, color: needle_s });
+            tv.push(TextVertex { pos: [b0x, b0y], uv: suv, color: needle_s });
+            tv.push(TextVertex { pos: [b1x, b1y], uv: suv, color: needle_s });
+            // Hub.
+            self.atlas.rect(ccx - 2.5, ccy - 2.5, ccx + 2.5, ccy + 2.5, ring, &mut tv);
+
+            // Cardinal letters.
+            for (deg, lbl) in [(0.0f32, "N"), (90.0, "E"), (180.0, "S"), (270.0, "W")] {
+                let a = deg.to_radians();
+                let rr = cr - 17.0;
+                let (lx, ly) = (ccx + rr * a.sin(), ccy - rr * a.cos());
+                let lw = self.atlas.measure(lbl);
+                self.atlas.layout(lbl, lx - lw * 0.5, ly + 5.0, ring, &mut tv);
+            }
+        }
+
         self.draw_mode_button(&mut tv);
 
         // Upload + draw through the text pipeline; clear to a sky gradient base.

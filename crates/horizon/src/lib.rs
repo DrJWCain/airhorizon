@@ -52,6 +52,11 @@ pub struct Horizon {
     /// below the skyline — nearer ridge crests superseded by a much farther,
     /// higher fell behind them (Wainwright's "edge of one fell reveals the next").
     pub edges: Vec<Vec<(f32, f32)>>,
+    /// Per azimuth bucket: the visible surface profile, low angle to high — one
+    /// entry `(elev_rad, steepness)` per visible crest from the foreground up to
+    /// the skyline. `steepness` is the local rise/run of that face (high on
+    /// crags). Lets the panorama shade every visible slope, not just the skyline.
+    pub profile: Vec<Vec<(f32, f32)>>,
     /// Ground elevation sampled at the viewpoint (m).
     pub eye_ground_m: f64,
 }
@@ -174,12 +179,16 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
 
     let mut elev = vec![(-PI / 2.0) as f32; AZIMUTH_BUCKETS];
     let mut dist = vec![0.0f32; AZIMUTH_BUCKETS];
+    let mut profile: Vec<Vec<(f32, f32)>> = vec![Vec::new(); AZIMUTH_BUCKETS];
     let mut edges: Vec<Vec<(f32, f32)>> = vec![Vec::new(); AZIMUTH_BUCKETS];
     for i in 0..AZIMUTH_BUCKETS {
         let az = i as f64 * 0.1 * PI / 180.0;
         let (dx, dy) = (az.sin(), az.cos()); // BNG east, north
         let mut max_elev = -PI / 2.0;
         let mut best_d = 0.0;
+        // Previous sample, for the local rise/run of each visible face.
+        let mut last_h = h_eye;
+        let mut last_d = 0.0;
         let mut d = 50.0;
         while d <= params.max_range_m {
             let h_t = dem.elevation_bng(eye_e + dx * d, eye_n + dy * d);
@@ -192,19 +201,105 @@ pub fn cast(dem: &Dem, viewpoint: LatLon, params: &HorizonParams) -> Option<Hori
                     if best_d > 0.0 && d - best_d > EDGE_DEPTH_JUMP_M {
                         edges[i].push((max_elev as f32, best_d as f32));
                     }
+                    // This newly-revealed face is visible; record its top angle and
+                    // local steepness (rise to the crest from the previous sample).
+                    let run = d - last_d;
+                    let slope = if run > 0.0 { ((h_t - last_h) / run).max(0.0) } else { 0.0 };
+                    profile[i].push((elev_angle as f32, slope as f32));
                     max_elev = elev_angle;
                     best_d = d;
                 }
+                last_h = h_t;
+                last_d = d;
             }
-            // Step coarsens with distance: fine near the eye (DEM is 50 m), up
-            // to 600 m far out where the skyline subtends a tiny angle anyway.
-            d += (d * 0.015).clamp(30.0, 600.0);
+            // Step coarsens with distance: fine near the eye (LIDAR/DEM resolve
+            // crags), up to 600 m far out where the skyline subtends a tiny angle.
+            d += (d * 0.015).clamp(15.0, 600.0);
         }
         elev[i] = max_elev as f32;
         dist[i] = best_d as f32;
     }
 
-    Some(Horizon { elev_rad: elev, dist_m: dist, edges, eye_ground_m: ground })
+    Some(Horizon { elev_rad: elev, dist_m: dist, profile, edges, eye_ground_m: ground })
+}
+
+/// A visible incised channel (gill/ravine) sample, for the panorama overlay:
+/// `(azimuth_deg, elev_rad, depth_m, dist_m)`. `depth_m` is how far the channel
+/// floor sits below its banks (how dramatic the gill is); `dist_m` lets the
+/// renderer draw the gash to its true angular depth.
+pub type Ravine = (f32, f32, f32, f32);
+
+/// Find visible incised channels (gills/ravines) by walking the visible surface
+/// finely and flagging points that sit below higher ground on both sides across
+/// the line of sight — i.e. a channel cross-section you can actually see into.
+///
+/// Only worthwhile where the DEM is high-resolution (LIDAR), so callers should
+/// gate on [`Dem`] coverage. Uses a fixed fine step so narrow gills aren't
+/// stepped over the way the coarsening main cast would.
+pub fn ravines(
+    dem: &Dem,
+    viewpoint: LatLon,
+    params: &HorizonParams,
+    max_range_m: f64,
+    depth_min_m: f64,
+    bank_radius_m: f64,
+) -> Vec<Ravine> {
+    let (eye_e, eye_n) = geodesy::wgs84_to_bng(viewpoint.lat, viewpoint.lon);
+    let Some(ground) = dem.elevation_bng(eye_e, eye_n) else { return Vec::new() };
+    let h_eye = ground + params.eye_height_m;
+    let r_eff = EARTH_RADIUS_M / (1.0 - params.refraction_k);
+    const STEP_M: f64 = 8.0; // fine enough not to stride over a gill
+    // A gill floor sits below the visible face it's cut into; allow it to dip
+    // this far under the running silhouette and still count as seen. Keeps gills
+    // incised into the slope you're looking at (even deep ones), while excluding
+    // channels hidden in valleys well behind a ridge.
+    const VIS_TOL_RAD: f64 = 0.035; // ~2 deg
+
+    let mut out = Vec::new();
+    for i in 0..AZIMUTH_BUCKETS {
+        let az = i as f64 * 0.1 * PI / 180.0;
+        let (dx, dy) = (az.sin(), az.cos());
+        let (px, py) = (dy, -dx); // unit perpendicular to the ray (across-channel)
+        let mut max_elev = -PI / 2.0;
+        let mut d = 50.0;
+        while d <= max_range_m {
+            if let Some(h) = dem.elevation_bng(eye_e + dx * d, eye_n + dy * d) {
+                let elev_angle = ((h - h_eye - d * d / (2.0 * r_eff)) / d).atan();
+                // On (or just under) the visible front face?
+                if elev_angle >= max_elev - VIS_TOL_RAD {
+                    // Incision = deepest channel cut, checked across- and
+                    // along-ray at two widths (narrow gills and broad ravines).
+                    let sample = |de: f64, dn: f64| dem.elevation_bng(eye_e + de, eye_n + dn);
+                    let mut depth = f64::MIN;
+                    for &r in &[bank_radius_m, bank_radius_m * 2.0, bank_radius_m * 3.0] {
+                        let cross = match (
+                            sample(dx * d + px * r, dy * d + py * r),
+                            sample(dx * d - px * r, dy * d - py * r),
+                        ) {
+                            (Some(a), Some(b)) => a.min(b) - h,
+                            _ => f64::MIN,
+                        };
+                        let along = match (
+                            sample(dx * (d + r), dy * (d + r)),
+                            sample(dx * (d - r), dy * (d - r)),
+                        ) {
+                            (Some(a), Some(b)) => a.min(b) - h,
+                            _ => f64::MIN,
+                        };
+                        depth = depth.max(cross).max(along);
+                    }
+                    if depth >= depth_min_m {
+                        out.push((i as f32 * 0.1, elev_angle as f32, depth as f32, d as f32));
+                    }
+                }
+                if elev_angle > max_elev {
+                    max_elev = elev_angle;
+                }
+            }
+            d += STEP_M;
+        }
+    }
+    out
 }
 
 /// How much of a fell can be seen from the viewpoint.

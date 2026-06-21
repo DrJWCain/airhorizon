@@ -17,7 +17,7 @@ use basemap::{GeomKind, Mbtiles};
 use bytemuck::{Pod, Zeroable};
 use dem::Dem;
 use geodesy::{LatLon, Mercator, Tile, MERCATOR_MAX};
-use horizon::{cast, visible_peaks, visible_water, HorizonParams, Visibility, WaterMask};
+use horizon::{cast, ravines, visible_peaks, visible_water, HorizonParams, Visibility, WaterMask};
 use mapdata::{load_paths, PathKind};
 use peaks::Peaks;
 use lyon::math::point;
@@ -86,6 +86,7 @@ const PEAK_LABEL_COLOR: [f32; 3] = [0.60, 0.22, 0.0]; // visible summits: burnt 
 const SLOPE_LABEL_COLOR: [f32; 3] = [0.05, 0.18, 0.55]; // summit hidden, slopes in view: dark blue (reads on both sky and terrain)
 
 const DEM_DIR: &str = r"C:\maps\OS Terrain 50";
+const LIDAR_DIR: &str = r"C:\maps\airhorizon\data\lidar";
 
 /// What the viewer is showing.
 #[derive(Clone, Copy, PartialEq)]
@@ -113,8 +114,9 @@ struct PanoState {
     center_az: f64,
     fov_deg: f64,
     skyline: Vec<f32>, // horizon::AZIMUTH_BUCKETS elevation angles (radians)
+    profile: Vec<Vec<(f32, f32)>>, // per bucket: visible faces (elev_rad, steepness), low->high
+    ravines: Vec<(f32, f32, f32, f32)>, // incised channels: (az_deg, elev_rad, depth_m, dist_m)
     edge_lines: Vec<Vec<(f32, f32)>>, // linked occlusion edges: (azimuth_deg, elev_rad)
-    edge_top: Vec<f32>, // per bucket: highest occlusion-edge elev (rad), or -inf
     water: Vec<Vec<(f32, f32)>>, // per bucket: visible-water segments (top, bottom) elev (rad)
     peaks: Vec<PanoPeak>,
 }
@@ -624,14 +626,14 @@ struct AppState {
     pano: Option<PanoState>,
     show_edges: bool,
     show_water: bool,
+    /// Crag hatching (steepness-driven) in the panorama.
+    show_crags: bool,
+    /// Gill/ravine overlay (LIDAR-derived incised channels) in the panorama.
+    show_ravines: bool,
+    /// Compass-view zoom (1.0 = farthest fell at the rim).
+    compass_zoom: f64,
     /// Panorama render style: false = clean/natural, true = pen-and-ink artist view.
     artist: bool,
-}
-
-/// Cheap deterministic 0..1 jitter from an integer, for hand-drawn variation.
-fn jitter(i: u32) -> f32 {
-    let x = i.wrapping_mul(2_654_435_761);
-    ((x >> 8) & 0xffff) as f32 / 65_535.0
 }
 
 /// Push a thick screen-space line segment (two triangles) sampling the solid
@@ -1091,7 +1093,13 @@ impl AppState {
         if self.dem.is_none() {
             println!("panorama: loading DEM (first use)...");
             match Dem::open(std::path::Path::new(DEM_DIR)) {
-                Ok(d) => self.dem = Some(d),
+                Ok(mut d) => {
+                    let n = d.attach_lidar(std::path::Path::new(LIDAR_DIR));
+                    if n > 0 {
+                        println!("panorama: attached {n} LIDAR 1 m tiles (sharp crags near Wasdale)");
+                    }
+                    self.dem = Some(d);
+                }
                 Err(e) => {
                     eprintln!("panorama: DEM load failed: {e}");
                     return;
@@ -1100,10 +1108,28 @@ impl AppState {
         }
         let dem = self.dem.as_ref().unwrap();
         let params = HorizonParams::default();
+        // Pre-warm LIDAR around the viewpoint (parallel decode + disk cache) so
+        // the cast doesn't stall loading tiles one by one.
+        let (eye_e, eye_n) = geodesy::wgs84_to_bng(vp.lat, vp.lon);
+        let t_pre = std::time::Instant::now();
+        dem.preload_lidar_around(eye_e, eye_n, 15_000.0);
+        let pre_ms = t_pre.elapsed().as_millis();
+        if pre_ms > 50 {
+            println!("panorama: LIDAR ready in {pre_ms} ms");
+        }
         let Some(h) = cast(dem, vp, &params) else {
             eprintln!("panorama: ({:.4},{:.4}) is outside DEM coverage", vp.lat, vp.lon);
             return;
         };
+        // Gills/ravines: only meaningful at LIDAR resolution, within its range.
+        let ravine_pts = if dem.has_lidar() {
+            ravines(dem, vp, &params, 8_000.0, 6.0, 14.0)
+        } else {
+            Vec::new()
+        };
+        if !ravine_pts.is_empty() {
+            println!("panorama: {} gill/ravine points", ravine_pts.len());
+        }
         // Distance-scaled prominence cut: keep low-prominence fells when they're
         // near (e.g. Lingmell, a 72 m-drop shoulder, looms large from Wasdale),
         // but require real prominence for distant ones to avoid clutter.
@@ -1149,14 +1175,11 @@ impl AppState {
             ground_m: h.eye_ground_m,
             center_az,
             fov_deg: 90.0,
-            edge_top: h
-                .edges
-                .iter()
-                .map(|v| v.iter().map(|&(e, _)| e).fold(f32::NEG_INFINITY, f32::max))
-                .collect(),
             edge_lines: h.edge_polylines(),
             water,
             skyline: h.elev_rad,
+            profile: h.profile,
+            ravines: ravine_pts,
             peaks,
         });
     }
@@ -1174,6 +1197,8 @@ impl AppState {
 
         // Palette: natural (map-like) vs artist (pen-and-ink on paper).
         let artist = self.artist;
+        let show_crags = self.show_crags;
+        let show_ravines = self.show_ravines;
         let pal_sky = if artist {
             wgpu::Color { r: 0.93, g: 0.89, b: 0.80, a: 1.0 } // paper
         } else {
@@ -1204,21 +1229,43 @@ impl AppState {
         let start = ((pano.center_az - half) * 10.0).floor() as i32;
         let end = ((pano.center_az + half) * 10.0).ceil() as i32;
         let buckets = horizon::AZIMUTH_BUCKETS as i32;
+        // Hand-drawn line treatment: a gentle low-frequency meander (two sines,
+        // so it's smooth not jagged) plus slightly varying pen weight. Stronger
+        // in the artist view, which also gets a second sketch stroke.
+        let line_amp = if artist { 1.5 } else { 0.6 };
+        let wob = |b: i32, phase: f32| {
+            let bf = b as f32;
+            ((bf * 0.055 + phase).sin() * 0.8 + (bf * 0.15 + phase * 1.7).sin() * 0.45) * line_amp
+        };
+        let pen = |b: i32, base: f32| base + 0.45 * (b as f32 * 0.08).sin();
         let mut prev: Option<(f32, f32)> = None;
+        let mut prev2: Option<(f32, f32)> = None;
         for b in start..=end {
             let bucket = b.rem_euclid(buckets) as usize;
             let x = az_to_x(b as f64 * 0.1);
-            let y = elev_to_y((pano.skyline[bucket] as f64).to_degrees());
+            let base_y = elev_to_y((pano.skyline[bucket] as f64).to_degrees());
+            let y = base_y + wob(b, 0.0);
             if let Some((px, py)) = prev {
                 // terrain quad from the skyline down to the bottom of the screen
                 tri(px, py, px, vhf, x, y, terrain);
                 tri(x, y, px, vhf, x, vhf, terrain);
-                // skyline line (vertical thickness)
-                let t = 1.5;
+                // skyline line, slightly varying weight
+                let t = pen(b, 1.3);
                 tri(px, py - t, px, py + t, x, y - t, sky_line);
                 tri(x, y - t, px, py + t, x, y + t, sky_line);
             }
             prev = Some((x, y));
+            // Artist: a second, thinner stroke on a different phase — they drift
+            // apart and cross, giving an inked, sketched edge.
+            if artist {
+                let y2 = base_y + wob(b, 2.3) - 1.4;
+                if let Some((px2, py2)) = prev2 {
+                    let t2 = 0.7;
+                    tri(px2, py2 - t2, px2, py2 + t2, x, y2 - t2, sky_line);
+                    tri(x, y2 - t2, px2, py2 + t2, x, y2 + t2, sky_line);
+                }
+                prev2 = Some((x, y2));
+            }
         }
 
         // Visible water surface (lakes) as a blue band sitting in the valley,
@@ -1247,34 +1294,100 @@ impl AppState {
         tri(0.0, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 - 0.6, pal_eye);
         tri(vwf, y0 - 0.6, 0.0, y0 + 0.6, vwf, y0 + 0.6, pal_eye);
 
-        // Artist view: hatch a fringe of short, length-varied ink strokes hanging
-        // from the skyline — the shaded near-slope, hand-drawn feel.
-        if artist {
-            let hatch_c = [0.42, 0.34, 0.22];
+        // Crag shading: call out only steep, un-walkable ground. A visible face
+        // is hatched only where its slope exceeds STEEP (tan 45 deg = 1.0);
+        // walkable ground is left clean. Darkness ramps with how sheer it is.
+        if show_crags {
+            const STEEP: f32 = 1.0; // rise/run at 45 deg
+            let base_c = if artist { [0.40, 0.30, 0.18] } else { [0.24, 0.28, 0.22] };
+            let dark_c = if artist { [0.08, 0.05, 0.02] } else { [0.02, 0.03, 0.03] };
             let mut b = start;
             while b <= end {
                 let x = az_to_x(b as f64 * 0.1);
                 if x >= -2.0 && x <= vwf + 2.0 {
                     let bucket = b.rem_euclid(buckets) as usize;
-                    let sy = elev_to_y((pano.skyline[bucket] as f64).to_degrees());
-                    let mut len = 5.0 + jitter(b as u32) * 10.0;
-                    // If a ridge line sits close below the skyline here, pull the
-                    // hatch up to stop above it so the line stays clean.
-                    let te = pano.edge_top[bucket];
-                    if te.is_finite() {
-                        let edge_y = elev_to_y((te as f64).to_degrees());
-                        let allowed = (edge_y - 3.0) - (sy + 1.0);
-                        if allowed < len {
-                            len = allowed;
+                    let prof = &pano.profile[bucket];
+                    let xw = 0.6;
+                    // Each profile entry is the top of a visible face; it spans down
+                    // to the previous (lower) visible crest, or the image bottom.
+                    for j in 0..prof.len() {
+                        let (a_top, slope) = prof[j];
+                        if slope < STEEP {
+                            continue; // walkable: leave clean
                         }
-                    }
-                    if len > 1.0 {
-                        let xw = 0.5;
-                        tri(x - xw, sy + 1.0, x - xw, sy + 1.0 + len, x + xw, sy + 1.0, hatch_c);
-                        tri(x + xw, sy + 1.0, x - xw, sy + 1.0 + len, x + xw, sy + 1.0 + len, hatch_c);
+                        let y_top = elev_to_y((a_top as f64).to_degrees());
+                        let y_bot = if j > 0 {
+                            elev_to_y((prof[j - 1].0 as f64).to_degrees())
+                        } else {
+                            vhf
+                        };
+                        if y_bot - y_top < 0.4 || y_top > vhf || y_bot < 0.0 {
+                            continue;
+                        }
+                        // 45 deg -> mid-tone, ~63 deg (slope 2) -> near-black.
+                        let t = ((slope - STEEP) / 1.5).clamp(0.0, 1.0);
+                        let c = [
+                            base_c[0] + (dark_c[0] - base_c[0]) * t,
+                            base_c[1] + (dark_c[1] - base_c[1]) * t,
+                            base_c[2] + (dark_c[2] - base_c[2]) * t,
+                        ];
+                        tri(x - xw, y_top, x - xw, y_bot, x + xw, y_top, c);
+                        tri(x + xw, y_top, x - xw, y_bot, x + xw, y_bot, c);
                     }
                 }
-                b += 4; // ~every 0.4 deg
+                b += 3; // ~every 0.3 deg -> vertical hatching with gaps
+            }
+        }
+
+        // Gills & ravines: visible incised channels (LIDAR-derived) inked dark.
+        // Closely-spaced points merge into a gash down the fellside; deeper gills
+        // get taller, darker ticks.
+        if show_ravines {
+            // Pencil-hatched gully: short, jittered diagonal strokes down the
+            // incision with gaps between them, so it reads as built-up graphite
+            // shading rather than a solid bar. Deeper -> darker + cross-hatched.
+            let light = if artist { [0.50, 0.42, 0.30] } else { [0.40, 0.42, 0.46] };
+            let dark = if artist { [0.20, 0.15, 0.08] } else { [0.13, 0.15, 0.19] };
+            for &(az_deg, elev_rad, depth, dist) in &pano.ravines {
+                // The immediate foreground is all minor becks looming large -
+                // skip it and fade in with distance so mid/far gashes carry it.
+                if dist < 400.0 {
+                    continue;
+                }
+                let x = az_to_x(az_deg as f64);
+                if x < -2.0 || x > vwf + 2.0 {
+                    continue;
+                }
+                let y0 = elev_to_y((elev_rad as f64).to_degrees());
+                // True angular depth: a 30 m gill projects a long gash.
+                let drop_deg = (depth as f64 / dist.max(1.0) as f64).atan().to_degrees();
+                let gash = ((drop_deg as f32) * px_per_deg as f32).clamp(3.0, 48.0);
+                let fade = ((dist - 400.0) / 1000.0).clamp(0.0, 1.0); // faint near, full by ~1.4 km
+                let t = ((depth - 6.0) / 22.0).clamp(0.0, 1.0) * fade;
+                let c = [
+                    light[0] + (dark[0] - light[0]) * t,
+                    light[1] + (dark[1] - light[1]) * t,
+                    light[2] + (dark[2] - light[2]) * t,
+                ];
+                // Sparser hatch (one stroke per ~4.5 px), thinned further near.
+                let n = ((gash / 4.5 * (0.5 + 0.5 * fade)) as i32).clamp(1, 12);
+                for k in 0..n {
+                    let f = (k as f32 + 0.5) / n as f32;
+                    let cy = y0 + f * gash;
+                    let r1 = ((az_deg * 91.7 + k as f32 * 7.3).sin() * 43758.5).fract().abs();
+                    let r2 = ((az_deg * 53.3 + k as f32 * 11.1).sin() * 24634.6).fract().abs();
+                    let len = 3.0 + 2.5 * r1;
+                    let dir = if k & 1 == 0 { 1.0 } else { -0.7 }; // mostly one way, some cross-hatch
+                    let ox = (r2 - 0.5) * 2.0;
+                    let (sx0, sy0) = (x + ox - len * 0.6 * dir, cy - len * 0.5);
+                    let (sx1, sy1) = (x + ox + len * 0.6 * dir, cy + len * 0.5);
+                    let (ddx, ddy) = (sx1 - sx0, sy1 - sy0);
+                    let l = (ddx * ddx + ddy * ddy).sqrt().max(0.5);
+                    let hw = 0.45;
+                    let (nx, ny) = (-ddy / l * hw, ddx / l * hw);
+                    tri(sx0 + nx, sy0 + ny, sx0 - nx, sy0 - ny, sx1 + nx, sy1 + ny, c);
+                    tri(sx1 + nx, sy1 + ny, sx0 - nx, sy0 - ny, sx1 - nx, sy1 - ny, c);
+                }
             }
         }
 
@@ -1292,9 +1405,11 @@ impl AppState {
                     if x0.max(x1) < -2.0 || x0.min(x1) > vwf + 2.0 {
                         continue; // off-screen
                     }
-                    let y0 = elev_to_y((w[0].1 as f64).to_degrees());
-                    let y1 = elev_to_y((w[1].1 as f64).to_degrees());
-                    let t = 0.8;
+                    let b0 = (w[0].0 * 10.0) as i32;
+                    let b1 = (w[1].0 * 10.0) as i32;
+                    let y0 = elev_to_y((w[0].1 as f64).to_degrees()) + wob(b0, 0.9);
+                    let y1 = elev_to_y((w[1].1 as f64).to_degrees()) + wob(b1, 0.9);
+                    let t = pen(b0, 0.9);
                     tri(x0, y0 - t, x0, y0 + t, x1, y1 - t, edge_c);
                     tri(x1, y1 - t, x0, y0 + t, x1, y1 + t, edge_c);
                 }
@@ -1337,7 +1452,7 @@ impl AppState {
 
         // HUD hint.
         let hud = format!(
-            "PANORAMA {} ({:.4}, {:.4})  ground {:.0} m   (V:map  drag:scrub  wheel:zoom  N:names  E:edges  W:water  A:style)",
+            "PANORAMA {} ({:.4}, {:.4})  ground {:.0} m   (V:map  drag:scrub  wheel:zoom  N:names  E:edges  W:water  G:crags  J:gills  A:style)",
             if artist { "[artist]" } else { "[natural]" },
             pano.viewpoint.lat,
             pano.viewpoint.lon,
@@ -1479,16 +1594,20 @@ impl AppState {
             .map(|p| p.dist_km * 0.621_371)
             .fold(1.0_f64, f64::max)
             .min(25.0) as f32;
-        let scale = r_px / max_mi.max(1.0);
+        // zoom 1.0 fits the farthest fell at the rim; zoom in to spread the near
+        // cluster (reveals more labels), zoom out to compress.
+        let scale = r_px / max_mi.max(1.0) * self.compass_zoom as f32;
 
         let mut tv: Vec<TextVertex> = Vec::new();
 
-        // Distance rings (miles) + ring labels.
+        // Distance rings (miles) within the rim + a mile label on each.
         for &mi in &[1.0f32, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 25.0] {
-            if mi > max_mi + 0.01 {
+            let rad = mi * scale;
+            if rad > r_px + 0.5 {
                 break;
             }
-            push_circle(&mut tv, uv, cx, cy, mi * scale, 0.8, ring_c);
+            push_circle(&mut tv, uv, cx, cy, rad, 0.8, ring_c);
+            self.atlas.layout(&format!("{:.0}", mi), cx + 3.0, cy - rad + 5.0, ring_c, &mut tv);
         }
         // Cardinal radials + letters (north up, clockwise).
         for (deg, lbl) in [(0.0f32, "N"), (90.0, "E"), (180.0, "S"), (270.0, "W")] {
@@ -1506,7 +1625,10 @@ impl AppState {
         let h = self.atlas.px;
         for pk in &pano.peaks {
             let mi = (pk.dist_km * 0.621_371) as f32;
-            let r = (mi * scale).min(r_px);
+            let r = mi * scale;
+            if r > r_px {
+                continue; // beyond the rim at this zoom
+            }
             let a = (pk.bearing_deg as f32).to_radians();
             let (px, py) = (cx + r * a.sin(), cy - r * a.cos());
             let c = if pk.obscured { slope_c } else { peak_c };
@@ -1531,7 +1653,7 @@ impl AppState {
 
         self.atlas.layout(
             &format!(
-                "COMPASS  ({:.4}, {:.4})  ground {:.0} m   (rings = miles, N up;  C/V/button: views)",
+                "COMPASS  ({:.4}, {:.4})  ground {:.0} m   (rings = miles, N up;  wheel/pinch: zoom;  C/V/button: views)",
                 pano.viewpoint.lat, pano.viewpoint.lon, pano.ground_m
             ),
             8.0,
@@ -2005,6 +2127,9 @@ impl ApplicationHandler for App {
             pano: None,
             show_edges: true,
             show_water: true,
+            show_crags: true,
+            show_ravines: true,
+            compass_zoom: 1.0,
             artist: false,
         });
         self.state.as_ref().unwrap().window.request_redraw();
@@ -2060,6 +2185,22 @@ impl ApplicationHandler for App {
                 s.show_water = !s.show_water;
                 s.window.request_redraw();
                 println!("water: {}", if s.show_water { "on" } else { "off" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyG) =>
+            {
+                s.show_crags = !s.show_crags;
+                s.window.request_redraw();
+                println!("crags: {}", if s.show_crags { "on" } else { "off" });
+            }
+            WindowEvent::KeyboardInput { event, .. }
+                if event.state == ElementState::Pressed
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyJ) =>
+            {
+                s.show_ravines = !s.show_ravines;
+                s.window.request_redraw();
+                println!("gills/ravines: {}", if s.show_ravines { "on" } else { "off" });
             }
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed
@@ -2205,7 +2346,11 @@ impl ApplicationHandler for App {
                                                     .rem_euclid(360.0);
                                             }
                                         }
-                                        Mode::Compass => {}
+                                        Mode::Compass => {
+                                            // Pinch apart zooms the plan in (reveals near fells).
+                                            s.compass_zoom = (s.compass_zoom * dist / pdist.max(1.0))
+                                                .clamp(0.3, 12.0);
+                                        }
                                     }
                                     s.window.request_redraw();
                                 }
@@ -2235,7 +2380,9 @@ impl ApplicationHandler for App {
                             p.fov_deg = (p.fov_deg * 1.1f64.powf(-scroll)).clamp(20.0, 160.0);
                         }
                     }
-                    Mode::Compass => {}
+                    Mode::Compass => {
+                        s.compass_zoom = (s.compass_zoom * 1.15f64.powf(scroll)).clamp(0.3, 12.0);
+                    }
                 }
                 s.window.request_redraw();
             }

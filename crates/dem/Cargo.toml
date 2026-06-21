@@ -10,3 +10,5 @@ description = "UK Digital Elevation Model: OS Terrain 50 ASCII Grid lookup, by W
 geodesy = { path = "../geodesy" }
 walkdir = "2"
 thiserror = "1"
+tiff = "0.9"
+zip = { version = "3", default-features = false, features = ["deflate"] }

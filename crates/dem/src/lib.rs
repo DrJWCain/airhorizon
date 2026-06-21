@@ -8,6 +8,7 @@
 //! wide horizon cast doesn't thrash (a 75 km cast spans ~200 of the 10 km tiles).
 
 pub mod asc;
+pub mod lidar;
 
 use geodesy::LatLon;
 use std::cell::RefCell;
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 pub use asc::{AscHeader, AscTile};
+pub use lidar::Lidar;
 
 #[derive(thiserror::Error, Debug)]
 pub enum DemError {
@@ -32,6 +34,9 @@ pub enum DemError {
 pub struct Dem {
     tiles: std::collections::HashMap<(i32, i32), PathBuf>,
     cache: RefCell<TileCache>,
+    /// Optional 1 m LIDAR overlay, sampled in preference to Terrain 50 where it
+    /// has coverage (sharpens near crags/cliffs around Wasdale).
+    lidar: Option<Lidar>,
 }
 
 struct TileCache {
@@ -96,7 +101,29 @@ impl Dem {
             return Err(DemError::Empty(dir.to_path_buf()));
         }
         // Large cache: a wide horizon cast revisits ~200 tiles many times.
-        Ok(Dem { tiles, cache: RefCell::new(TileCache::new(1024)) })
+        Ok(Dem { tiles, cache: RefCell::new(TileCache::new(1024)), lidar: None })
+    }
+
+    /// Attach a 1 m LIDAR overlay (e.g. `data/lidar`). Sampled in preference to
+    /// Terrain 50 wherever it has coverage. No-op if the directory is absent or
+    /// empty. Returns the number of LIDAR tiles indexed.
+    pub fn attach_lidar(&mut self, dir: &Path) -> usize {
+        self.lidar = Lidar::open(dir);
+        self.lidar.as_ref().map(|l| l.tile_count()).unwrap_or(0)
+    }
+
+    /// Pre-warm the LIDAR overlay around a BNG point (parallel decode + disk
+    /// cache) so the first cast there doesn't stall. No-op without LIDAR.
+    pub fn preload_lidar_around(&self, e: f64, n: f64, radius: f64) {
+        if let Some(lidar) = &self.lidar {
+            lidar.preload_around(e, n, radius);
+        }
+    }
+
+    /// True if a 1 m LIDAR overlay is attached (gills/ravines are only worth
+    /// detecting at LIDAR resolution).
+    pub fn has_lidar(&self) -> bool {
+        self.lidar.is_some()
     }
 
     pub fn tile_count(&self) -> usize {
@@ -106,6 +133,12 @@ impl Dem {
     /// Elevation (m) at a BNG easting/northing, or None outside coverage / on
     /// NODATA. The ray-caster's hot path.
     pub fn elevation_bng(&self, e: f64, n: f64) -> Option<f64> {
+        // Prefer 1 m LIDAR where it covers the point; fall back to Terrain 50.
+        if let Some(lidar) = &self.lidar {
+            if let Some(v) = lidar.elevation_bng(e, n) {
+                return Some(v);
+            }
+        }
         let key = tile_key(e, n);
         let path = self.tiles.get(&key)?;
         let mut cache = self.cache.borrow_mut();
